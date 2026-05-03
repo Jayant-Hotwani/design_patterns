@@ -1,0 +1,272 @@
+# Smart Pointers in C++ — Complete Theory Notes
+
+---
+
+## 1. The Problem: Why Raw Pointers Are Dangerous
+
+In C++, dynamic memory is managed manually using `new` and `delete`. This creates four classic failure modes:
+
+**Memory leak** — forgetting `delete`. The object lives on the heap forever with no way to reach it.
+
+**Dangling pointer** — using the pointer after `delete`. The memory may have been reused; you're reading garbage or corrupting data.
+
+**Double free** — calling `delete` twice on the same address. Undefined behavior — crashes or silent corruption.
+
+**Exception unsafety** — if an exception is thrown between `new` and `delete`, the `delete` never runs.
+
+```cpp
+void risky() {
+    int* p = new int(42);
+    doSomethingThatMightThrow();  // if this throws...
+    delete p;                     // ...this never runs → leak
+}
+```
+
+Smart pointers solve all four problems through one principle: **RAII**.
+
+---
+
+## 2. RAII — The Foundation
+
+**Resource Acquisition Is Initialization** is the core C++ idiom behind smart pointers.
+
+The rule: tie the lifetime of a resource to the lifetime of an object.
+- When the object is constructed → acquire the resource
+- When the object is destroyed → release the resource
+
+Since C++ guarantees that destructors run when objects go out of scope (even during exceptions), RAII makes resource management automatic and exception-safe.
+
+A smart pointer is a class that:
+- Holds a raw pointer internally
+- Acquires heap memory on construction
+- Releases it in the destructor
+- Overloads `*` and `->` so it feels like a real pointer
+
+---
+
+## 3. Ownership — The Central Concept
+
+Every smart pointer is built around **ownership**: the right and responsibility to delete an object.
+
+The three questions that determine which smart pointer to use:
+1. Should exactly **one** thing own this object? → `unique_ptr`
+2. Should **multiple** things share ownership? → `shared_ptr`
+3. Do I need to **observe** without owning? → `weak_ptr`
+
+Ownership is not the same as access. Many things can read/write an object via raw pointers or references — but only the owner is responsible for freeing it.
+
+---
+
+## 4. unique_ptr — Exclusive Ownership
+
+### Ownership model
+Exactly one `unique_ptr` owns the managed object at any time. When it goes out of scope, the object is deleted automatically.
+
+### Move semantics
+`unique_ptr` is **move-only** — it cannot be copied, because that would create two owners. Ownership can be transferred (moved) but not shared.
+
+```cpp
+auto p1 = std::make_unique<int>(10);
+auto p2 = p1;            // COMPILE ERROR — copy deleted
+auto p2 = std::move(p1); // OK — ownership transferred, p1 = null
+```
+
+After a move, the source is set to `nullptr`. Dereferencing it is undefined behavior.
+
+### Zero overhead
+`unique_ptr` has exactly zero runtime overhead over a raw pointer. It is purely a compile-time safety mechanism.
+
+### Custom deleters
+`unique_ptr` accepts a second template parameter — a deleter — so it can manage any resource, not just heap memory (file handles, mutex locks, GPU buffers).
+
+```cpp
+auto f = std::unique_ptr<FILE, decltype(&fclose)>(fopen("x.txt","r"), &fclose);
+```
+
+### Key operations
+
+```cpp
+auto p = std::make_unique<int>(10);
+
+*p;                         // dereference
+p.get();                    // raw pointer (don't delete it!)
+p->member;                  // arrow operator
+
+auto p2 = std::move(p);     // transfer ownership; p is now null
+int* raw = p2.release();    // p2 is null; you own raw now (must delete!)
+p2.reset();                 // deletes and sets to null
+p2.reset(new int(99));      // deletes old, takes new
+```
+
+---
+
+## 5. shared_ptr — Shared Ownership
+
+### Ownership model
+Multiple `shared_ptr` instances can point to the same object. The object is destroyed when the **last** owner is destroyed or reset. Managed via **reference counting**.
+
+```cpp
+auto p1 = std::make_shared<int>(42);
+auto p2 = p1;   // both own it, ref count = 2
+
+p1.reset();     // ref count = 1, still alive
+p2.reset();     // ref count = 0 → object deleted
+```
+
+### The control block
+When a `shared_ptr` is created, it allocates a **control block** on the heap. The control block stores:
+- `ref_count` — how many `shared_ptr` instances own this object
+- `weak_count` — how many `weak_ptr` instances observe this object
+- The deleter and allocator (if custom)
+
+Every copy atomically increments `ref_count`. Every destruction atomically decrements it. When it hits zero, the managed object is destroyed. The control block lives until `weak_count` also hits zero.
+
+### make_shared vs shared_ptr(new T)
+
+```cpp
+auto p1 = std::make_shared<Foo>(args);   // ONE heap allocation  ← prefer this
+auto p2 = std::shared_ptr<Foo>(new Foo); // TWO heap allocations
+```
+
+`make_shared` allocates the object and control block together — faster, better cache locality. Always prefer it.
+
+### Thread safety
+The reference count is **atomic** — thread-safe. But the **object itself** is not protected. You still need a mutex if two threads write to the same object.
+
+### Overhead vs unique_ptr
+- Two pointer members instead of one
+- Atomic increment/decrement on every copy and destruction
+- Two heap allocations if not using `make_shared`
+
+Use `unique_ptr` by default. Reach for `shared_ptr` only when shared ownership is genuinely needed.
+
+---
+
+## 6. weak_ptr — Non-Owning Observer
+
+### The problem it solves — cyclic references
+If two objects each hold a `shared_ptr` to the other, ref counts never reach zero and memory is never freed.
+
+```cpp
+struct Node { std::shared_ptr<Node> next; };
+
+auto a = std::make_shared<Node>();
+auto b = std::make_shared<Node>();
+a->next = b;   // rc(b) = 2
+b->next = a;   // rc(a) = 2
+// both go out of scope: rc drops to 1, never 0 → memory leak forever
+```
+
+### What weak_ptr does
+`weak_ptr` points to an object managed by `shared_ptr` but **does not affect `ref_count`**. It increments only `weak_count`, which keeps the control block alive but allows the object to be freed when `ref_count` hits zero.
+
+### Expiry and lock()
+Because `weak_ptr` doesn't keep its object alive, the object might be deleted while the `weak_ptr` still exists. To access it safely, call `.lock()`:
+- Returns a `shared_ptr` if the object is still alive (temporarily bumps ref count)
+- Returns `nullptr` if the object has been freed
+
+```cpp
+// WRONG — race condition: object might die between check and use
+if (!wp.expired()) use(*wp);
+
+// RIGHT — atomic check + access
+if (auto sp = wp.lock()) use(*sp);
+```
+
+### Fix the cycle with weak_ptr
+
+```cpp
+struct Node {
+    std::shared_ptr<Node> next;  // forward link: strong ownership
+    std::weak_ptr<Node>   prev;  // backward link: non-owning — cycle broken
+};
+```
+
+---
+
+## 7. Object Lifetime vs Control Block Lifetime
+
+| Event | Object destroyed? | Control block destroyed? |
+|---|---|---|
+| ref_count → 0 | Yes | Not yet |
+| weak_count → 0 | — | Yes |
+| Both → 0 | Yes | Yes |
+
+The control block outlives the object when `weak_ptr` instances still exist. This is why `weak_ptr` can correctly report `.expired() == true` — the control block is still there to be queried even though the object is gone.
+
+---
+
+## 8. enable_shared_from_this
+
+Inside a method, `this` is a raw pointer. If you construct a new `shared_ptr` directly from `this`, it creates a **second independent control block** — leading to a double-free when both think they're the sole owner.
+
+Fix: inherit from `std::enable_shared_from_this<Foo>`. It stores a `weak_ptr` to `this` inside the object. `shared_from_this()` locks that weak_ptr, returning a `shared_ptr` that shares the **existing** control block.
+
+```cpp
+class Foo : public std::enable_shared_from_this<Foo> {
+public:
+    std::shared_ptr<Foo> getself() {
+        return shared_from_this();  // safe — same control block
+    }
+};
+```
+
+---
+
+## 9. Comparison Table
+
+| Feature | unique_ptr | shared_ptr | weak_ptr |
+|---|---|---|---|
+| Ownership | Exclusive | Shared | None |
+| Copyable | No | Yes | Yes |
+| Movable | Yes | Yes | Yes |
+| Ref count overhead | No | Yes | Yes |
+| Breaks cycles | — | No | Yes |
+| Needs .lock() | No | No | Yes |
+| Thread-safe ref count | — | Yes | Yes |
+| Runtime performance | Zero overhead | Slight overhead | Slight overhead |
+
+---
+
+## 10. Best Practices
+
+**Always use make_unique / make_shared** — never expose raw `new`.
+```cpp
+auto p = std::make_shared<Foo>(a, b);   // correct
+std::shared_ptr<Foo> p(new Foo(a, b));  // avoid
+```
+
+**Pass by raw pointer or reference when no ownership is transferred.**
+```cpp
+void process(MyClass* obj) { ... }  // doesn't own, just uses
+process(sp.get());                  // extract raw pointer
+process(*sp);                       // or pass by reference
+```
+
+**Never manage the same object with two independent shared_ptrs.**
+```cpp
+int* raw = new int(5);
+shared_ptr<int> p1(raw);
+shared_ptr<int> p2(raw);  // UNDEFINED BEHAVIOUR — double free!
+```
+
+**Use unique_ptr by default. Reach for shared_ptr only when the design genuinely requires shared ownership.** The most common mistake is defaulting to `shared_ptr` because it feels "safer." `unique_ptr` expresses stronger intent and has zero overhead.
+
+**Use weak_ptr for back-pointers, caches, and observer patterns** — anything that needs to watch an object without keeping it alive.
+
+---
+
+## 11. Decision Guide
+
+```
+Need heap memory?
+│
+├── One clear owner → unique_ptr   (zero overhead, always default)
+│
+├── Multiple shared owners → shared_ptr   (ref-counted)
+│       │
+│       └── Cycle or non-owning ref needed? → weak_ptr
+│
+└── No ownership, just access → raw pointer or reference
+                                (never delete through these)
+```
