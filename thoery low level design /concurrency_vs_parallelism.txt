@@ -1,0 +1,1246 @@
+Concurrency vs Parallelism
+
+CONCURRENCY - SYSTEM DESIGN INTERVIEW GUIDE
+=============================================
+
+Concurrency shows up constantly in system design interviews - not usually as
+"explain mutexes" but as "how do multiple things happen at once without
+corrupting data, causing race conditions, or crashing under load." Here's a
+structured breakdown of what you actually need for interviews.
+
+
+1. CONCURRENCY VS. PARALLELISM (clarify this first)
+-----------------------------------------------------
+- Concurrency: multiple tasks make progress during overlapping time periods -
+  doesn't require multiple cores. Achieved via context switching / interleaving
+  (e.g., a single-threaded event loop handling many I/O-bound requests).
+- Parallelism: multiple tasks execute literally simultaneously, requiring
+  multiple cores/machines.
+
+Interviewers love this distinction because it maps directly to real
+architecture decisions: Node.js is concurrent (event loop, single-threaded)
+but not inherently parallel; a multi-core Java thread pool is both.
+
+
+2. CORE PROBLEMS CONCURRENCY CREATES
+-----------------------------------------------------
+
+a) Race Conditions
+Two or more threads/processes access shared state, and the outcome depends
+on timing.
+
+Classic interview example: Two servers incrementing a "remaining inventory
+count" simultaneously without synchronization -> overselling.
+
+    Thread A reads count = 5
+    Thread B reads count = 5
+    Thread A writes count = 4
+    Thread B writes count = 4   <- lost update! should be 3
+
+b) Deadlocks
+Two or more threads/processes wait on each other's locks forever.
+
+    Thread 1: locks Resource A, waits for Resource B
+    Thread 2: locks Resource B, waits for Resource A
+    -> neither proceeds
+
+Prevention strategies to mention: lock ordering (always acquire locks in a
+consistent global order), lock timeouts, avoiding nested locks, using
+try-lock with backoff.
+
+c) Starvation & Livelock
+- Starvation: a thread never gets CPU time or a lock because others are
+  prioritized.
+- Livelock: threads keep changing state in response to each other but make
+  no real progress (e.g., two people repeatedly stepping aside for each
+  other in a hallway).
+
+
+3. CONCURRENCY CONTROL MECHANISMS (know these cold)
+-----------------------------------------------------
+
+Mutex/Lock
+  What it does: Only one thread can hold it at a time
+  When to mention it: Protecting a critical section (e.g., updating a
+  shared counter)
+
+Semaphore
+  What it does: Allows N threads to access a resource simultaneously
+  When to mention it: Limiting concurrent DB connections, rate limiting
+
+Read-Write Lock
+  What it does: Multiple readers OR one writer, not both
+  When to mention it: High-read, low-write shared data (e.g., config cache)
+
+Optimistic Locking
+  What it does: Don't lock; check a version number before commit, retry on
+  conflict
+  When to mention it: High-throughput systems where conflicts are rare
+  (e.g., e-commerce cart)
+
+Pessimistic Locking
+  What it does: Lock the row/resource before doing anything
+  When to mention it: When conflicts are frequent/costly (e.g., seat
+  booking)
+
+Compare-And-Swap (CAS)
+  What it does: Atomic hardware-level operation: update only if value
+  hasn't changed
+  When to mention it: Lock-free counters, distributed locks
+
+In distributed systems specifically, mention:
+- Distributed locks (via Redis SETNX/Redlock, or Zookeeper/etcd) - used
+  when multiple machines, not just threads, need mutual exclusion.
+- Leader election (via Zookeeper, etcd, Raft) - ensuring only one node
+  performs a task (e.g., cron job across replicas).
+
+
+4. OPTIMISTIC VS PESSIMISTIC CONCURRENCY - a favorite interview deep-dive
+-----------------------------------------------------
+
+Optimistic Concurrency Control (OCC):
+    1. Read row, note version = 5
+    2. Do work (client-side, no lock held)
+    3. UPDATE ... SET data=?, version=6 WHERE id=? AND version=5
+    4. If 0 rows affected -> someone else updated it first -> retry
+
+Good for low-contention systems (most requests won't conflict) - avoids
+holding locks during slow operations.
+
+Pessimistic Concurrency Control:
+    1. SELECT ... FOR UPDATE  (locks the row)
+    2. Do work
+    3. UPDATE
+    4. COMMIT (releases lock)
+
+Good when conflicts are common and retries would be wasteful/costly (e.g.,
+booking the last concert ticket).
+
+Interview tip: always tie the choice to the contention level and cost of
+retry - this is what separates a memorized answer from a reasoned one.
+
+
+5. CONCURRENCY AT DIFFERENT SYSTEM LAYERS
+-----------------------------------------------------
+
+a) Application/Thread Level
+- Thread pools (bounded, to avoid unbounded thread creation crashing the
+  system)
+- Async/await, event loops (Node.js, Nginx) for I/O-bound concurrency
+  without thread-per-request overhead
+- Producer-consumer patterns with bounded queues (backpressure)
+
+b) Database Level
+- Row-level locking, isolation levels (READ COMMITTED, REPEATABLE READ,
+  SERIALIZABLE)
+- Isolation level tradeoffs are a great thing to bring up:
+    * READ COMMITTED - prevents dirty reads, allows non-repeatable reads
+    * REPEATABLE READ - prevents non-repeatable reads, allows phantom reads
+    * SERIALIZABLE - fully isolated, but heavy performance cost
+- MVCC (Multi-Version Concurrency Control) - Postgres/MySQL InnoDB
+  approach: readers don't block writers, by keeping multiple row versions
+
+c) Distributed System Level
+- Idempotency keys - critical for handling retries/duplicate requests
+  safely (e.g., payment APIs)
+- Distributed transactions - Two-Phase Commit (2PC) vs Saga pattern (for
+  microservices, since 2PC doesn't scale well across services)
+- Message queues - decouple producers/consumers, smooth out load spikes,
+  provide ordering guarantees (or not - know the difference between FIFO
+  queues like SQS FIFO vs standard)
+- Eventual consistency vs strong consistency trade-off (ties into CAP
+  theorem)
+
+
+6. A CONCRETE SYSTEM DESIGN EXAMPLE: "Design a Ticket Booking System"
+-----------------------------------------------------
+
+This is a perfect vehicle to demonstrate concurrency knowledge:
+
+Problem: Two users try to book the last seat simultaneously.
+
+Bad approach: Read seat status -> check available -> write "booked". Race
+condition: both reads happen before either write.
+
+Good approaches to discuss:
+1. Pessimistic DB lock: SELECT * FROM seats WHERE id=? FOR UPDATE - simple,
+   safe, but doesn't scale to huge contention (e.g., flash sales).
+2. Optimistic locking with version column - better throughput, requires
+   retry logic on the client.
+3. Distributed lock via Redis (SET seat:123 locked NX EX 10) - useful when
+   the booking flow spans multiple steps/services (reserve -> payment ->
+   confirm), not just one SQL statement.
+4. Queue-based serialization - push booking requests into a queue, single
+   consumer processes them sequentially per seat/resource - trades latency
+   for correctness, popular for flash-sale style systems (like ticket
+   drops).
+
+Follow-up interviewer will likely ask: "What if the payment takes 2 minutes
+and the user abandons it?" -> discuss reservation TTL / expiry (temporarily
+hold the seat, release lock automatically after timeout) - ties
+concurrency control to real business logic.
+
+
+7. IDEMPOTENCY - the concept interviewers love to test alongside concurrency
+-----------------------------------------------------
+
+If a network call is retried (client timeout, duplicate message delivery),
+the same request might be processed twice concurrently or sequentially.
+Idempotency keys ensure the second attempt is a no-op:
+
+    POST /charge  { idempotency_key: "abc123", amount: 50 }
+
+Server stores abc123 -> result mapping; if seen again, returns the cached
+result instead of charging twice. This matters especially in concurrent
+retry storms (e.g., mobile app retries on flaky network).
+
+
+8. HOW TO STRUCTURE YOUR ANSWER IN AN INTERVIEW
+-----------------------------------------------------
+
+When concurrency comes up (often as a follow-up, not the headline
+question), a strong structure is:
+
+1. Identify the shared resource (row, counter, seat, inventory count,
+   cache key).
+2. State the race condition explicitly - walk through the interleaving
+   that causes the bug, like the inventory example above. This shows
+   you're not just naming buzzwords.
+3. Propose a mechanism (lock, optimistic check, queue, distributed lock) -
+   and justify the choice based on contention and latency needs.
+4. Discuss trade-offs - throughput vs correctness, complexity vs
+   consistency, failure modes (what if the lock-holder crashes? need lock
+   timeouts/leases).
+5. Mention monitoring/failure recovery - e.g., a lease-based distributed
+   lock should have TTL so a crashed holder doesn't block everyone
+   forever.
+
+
+9. QUICK-FIRE TERMS TO HAVE READY
+-----------------------------------------------------
+- CAP theorem (Consistency, Availability, Partition tolerance - pick 2
+  during a partition)
+- MVCC
+- Two-phase commit vs Saga pattern
+- Backpressure
+- Idempotency
+- Optimistic vs pessimistic locking
+- Leader election
+- Compare-and-swap
+- Thread pool / connection pool sizing
+
+
+
+
+
+
+
+
+
+PROCESS & THREAD STRUCTURE - DETAILED BREAKDOWN
+=================================================
+
+Let's build out the full picture of what a process and thread actually look
+like in memory and in the OS, piece by piece.
+
+
+THE PROCESS: THE CONTAINER
+-----------------------------------------------------
+When you launch a program, the OS creates a process - a sandboxed unit that
+owns a set of resources. Think of it as the "account" under which everything
+runs. A process owns:
+
+- Address space - its own virtual memory layout (0x0000... to some max
+  address), completely isolated from other processes. Process A cannot see
+  or accidentally touch Process B's memory - the OS enforces this via
+  hardware (MMU + page tables).
+- Open file descriptors / handles - files, sockets, pipes it has open.
+- Heap - dynamically allocated memory (new, malloc).
+- Global/static data - variables declared at file scope or static.
+- Code segment - the compiled machine instructions being executed.
+- At least one thread - a process without any thread does nothing; the
+  "main thread" is created automatically when the process starts.
+
+    Process (isolated address space)
+    +----------------------------------------+
+    |  Code segment (compiled instructions)   |
+    |  Global / static data                   |
+    |  Heap (malloc/new'd memory)             |
+    |  Open file descriptors, sockets         |
+    |                                          |
+    |  +----------+  +----------+  +--------+ |
+    |  | Thread 1 |  | Thread 2 |  |Thread 3| |
+    |  +----------+  +----------+  +--------+ |
+    +----------------------------------------+
+
+
+THE THREAD: THE EXECUTION PATH
+-----------------------------------------------------
+A thread is the actual unit of execution - the thing the CPU scheduler
+picks up and runs. Multiple threads inside the same process are like
+multiple workers sharing the same office (heap, globals, files) but each
+has their own personal notebook (stack, registers, program counter) to
+track where they individually are in their work.
+
+Each thread has its own:
+
+1. Program Counter (PC) / Instruction Pointer
+A register holding the memory address of the next instruction this
+specific thread will execute. Since each thread can be at a completely
+different point in the code (or even executing different functions
+entirely), each needs its own PC - this is what lets thread A be in the
+middle of parseRequest() while thread B is in the middle of
+writeToDisk(), simultaneously.
+
+2. Registers
+CPU registers (general purpose, stack pointer, condition flags, etc.)
+reflect the current computation state of that thread - intermediate
+values, loop counters, function arguments being processed right now. When
+the OS pauses a thread to run another (a context switch), it saves that
+thread's register values into memory (its thread control block) and loads
+the next thread's saved register values back into the actual CPU
+registers.
+
+3. Stack
+Each thread gets its own private stack - used for:
+- Local variables
+- Function call/return addresses
+- Function parameters
+
+    Thread 1's stack        Thread 2's stack        Thread 3's stack
+    +---------------+       +---------------+       +---------------+
+    | main()        |       | main()        |       | main()        |
+    | handleReq()   |       | handleReq()   |       | handleReq()    |
+    | parseJSON()   |       | writeLog()    |       | queryDB()      |
+    | <- top        |       | <- top        |       | <- top         |
+    +---------------+       +---------------+       +---------------+
+
+This is why local variables are thread-safe by default - each thread's
+"int x = 5;" inside a function lives on that thread's own stack, invisible
+to other threads. Stacks are typically fixed-size (e.g., 1MB-8MB depending
+on OS/config) and allocated when the thread is created.
+
+
+WHAT THREADS SHARE (THE DANGEROUS PART)
+-----------------------------------------------------
+- Heap - anything allocated with new/malloc is visible to every thread in
+  the process. If Thread 1 does "int* p = new int(5);" and passes p to
+  Thread 2, Thread 2 can read/write that same memory.
+- Global/static variables - a "static int counter" is one single memory
+  location shared by all threads.
+- Open file descriptors, sockets, DB connections - if Thread 1 opens a
+  file, Thread 2 can also write to it (unless explicitly given separate
+  handles).
+
+This sharing is exactly why concurrency bugs (race conditions) happen - two
+threads racing to modify the same heap object or global counter is
+precisely "sibling execution paths stepping on shared state."
+
+    int sharedCounter = 0;   // lives on the heap/global segment - SHARED
+
+    void worker() {
+        int localTemp = 0;   // lives on THIS thread's stack - NOT shared
+        sharedCounter++;      // race condition risk - every thread touches this
+        localTemp++;          // perfectly safe - private per-thread
+    }
+
+
+THREAD CONTROL BLOCK (TCB) - HOW THE OS KEEPS TRACK
+-----------------------------------------------------
+For every thread, the OS kernel maintains a small data structure (the TCB)
+storing:
+
+- Thread ID
+- Saved register values (when not currently running)
+- Saved program counter
+- Stack pointer (location of that thread's stack)
+- Thread state: Running, Ready, Blocked/Waiting
+- Scheduling info: priority, time slice remaining
+- Pointer back to its parent process (for shared resources: heap, file
+  table, etc.)
+
+    Process Control Block (PCB)
+    +---------------------------------------+
+    | Process ID                            |
+    | Address space / page table            |
+    | Open file table                       |
+    | Heap pointer                          |
+    |                                       |
+    |   TCB 1: [state: Running, PC: 0x4A2, regs..., stack ptr: 0x7FFE...] |
+    |   TCB 2: [state: Ready,   PC: 0x1B0, regs..., stack ptr: 0x7FF0...] |
+    |   TCB 3: [state: Blocked, PC: 0x2C4, regs..., stack ptr: 0x7FE8...] |
+    +---------------------------------------+
+
+
+THREAD STATES & CONTEXT SWITCHING
+-----------------------------------------------------
+A thread moves between states as the OS scheduler manages CPU time:
+
+- Running - actively executing on a CPU core right now.
+- Ready - waiting for CPU time (another thread is currently running).
+- Blocked/Waiting - paused, waiting on something (I/O, a lock, a sleep(),
+  a condition variable) - not competing for CPU until that event happens.
+
+Context switch: when the OS decides to stop running Thread A and start
+running Thread B (either because A's time slice expired, or A blocked on
+I/O), it:
+1. Saves Thread A's current register values + PC into Thread A's TCB.
+2. Loads Thread B's saved register values + PC from Thread B's TCB into
+   the actual CPU.
+3. Resumes execution of Thread B exactly where it left off.
+
+This is fast but not free - it's part of why excessive threading
+(thousands of threads) can hurt performance: constant context switching
+wastes CPU cycles on bookkeeping rather than actual work.
+
+
+THREADS VS. PROCESSES - WHY THREADS ARE "LIGHTER"
+-----------------------------------------------------
+                        Process                  Thread
+Own address space       Yes (isolated)           No (shares parent's)
+Own heap                Yes                      Shared with siblings
+Own stack               Yes (one, for main       Yes, per thread
+                        thread)
+Creation cost           Expensive (new address   Cheap (just new stack
+                        space, page tables)       + TCB)
+Communication with      Requires IPC (pipes,     Direct - just read/write
+siblings                sockets, shared memory)   shared memory
+Crash isolation         One process crashing     One thread crashing
+                        doesn't affect another    (segfault) can take
+                                                   down the whole process
+
+This is why threads are used for concurrency within an app (fast, shared
+data, cheap to spin up) while separate processes are used when you want
+isolation/fault tolerance (e.g., a browser tab crashing shouldn't crash
+the whole browser - Chrome uses one process per tab partly for this
+reason).
+
+
+KERNEL THREADS VS. USER THREADS (WORTH KNOWING FOR INTERVIEWS)
+-----------------------------------------------------
+- Kernel-level threads (1:1 model) - each thread the language creates maps
+  directly to an OS-scheduled thread (e.g., std::thread in C++, Java
+  threads on most JVMs). The OS scheduler directly manages them, can run
+  them on separate cores in parallel.
+- User-level threads / green threads (M:N model) - the runtime (not the
+  OS) manages many lightweight "threads" multiplexed onto fewer actual OS
+  threads (e.g., Go's goroutines, older Java green threads). Cheaper to
+  create (can spawn hundreds of thousands), but the OS doesn't know they
+  exist individually - the language runtime does its own scheduling on
+  top of a small number of real OS threads.
+
+    1:1 model (e.g., C++ std::thread):
+      App Thread 1 -> OS Thread 1 -> CPU core
+      App Thread 2 -> OS Thread 2 -> CPU core
+
+    M:N model (e.g., Go goroutines):
+      Goroutine 1  \
+      Goroutine 2   >---> OS Thread 1 -> CPU core
+      Goroutine 3  /
+      Goroutine 4  ----->  OS Thread 2 -> CPU core
+
+
+PUTTING IT TOGETHER: A CONCRETE MENTAL MODEL
+-----------------------------------------------------
+    #include <thread>
+    #include <iostream>
+
+    int sharedCounter = 0;  // heap/global - SHARED across threads
+
+    void increment() {
+        int localVal = sharedCounter;  // 'localVal' lives on THIS thread's stack
+        localVal++;
+        sharedCounter = localVal;      // writing back to SHARED memory
+    }
+
+    int main() {
+        std::thread t1(increment);  // OS creates a new TCB, new stack, sets PC to increment()
+        std::thread t2(increment);  // another TCB, another stack, PC also at increment()
+
+        t1.join();  // main thread blocks (waiting state) until t1 finishes
+        t2.join();
+
+        std::cout << sharedCounter << std::endl;  // NOT guaranteed to be 2! race condition
+    }
+
+- t1 and t2 each get their own TCB, their own stack (so localVal is
+  genuinely separate for each), their own PC/registers.
+- Both read/write sharedCounter, which lives in the shared heap/global
+  segment of the one process - this is exactly the race condition setup
+  from the earlier concurrency discussion.
+- The OS scheduler interleaves (or truly parallelizes, on a multi-core
+  machine) t1 and t2's execution, context-switching between their TCBs as
+  needed.
+
+
+  MUTEXES AT THE OS LEVEL, THREAD POOLS, AND THE EVENT-LOOP MODEL
+==================================================================
+
+Let's cover all three, building on the process/thread foundation.
+
+
+1. MUTEXES & LOCKS AT THE OS LEVEL - FUTEXES ON LINUX
+-----------------------------------------------------
+
+The naive approach (and why it's bad)
+
+If a mutex were implemented purely as "keep checking a flag in a loop until
+it's free," that's called spinlocking:
+
+    while (locked) { /* keep checking, burning CPU */ }
+    locked = true;
+
+This wastes CPU cycles - the waiting thread stays in the Running state,
+spinning uselessly, when it could be doing something productive or
+letting another thread run. Fine for very short waits (some low-level
+kernel locks do spin briefly), but terrible for anything that might take
+a while.
+
+The real approach: block the thread
+
+What you actually want: a waiting thread should move to the
+Blocked/Waiting state (from the earlier TCB discussion), so the OS
+scheduler doesn't waste CPU time on it, and it gets woken up only when
+the lock becomes available.
+
+This requires the thread to ask the kernel to put it to sleep and wake it
+later - a system call. That's expensive if it happens on every single
+lock acquisition, even when there's no contention (i.e., the lock is free
+99% of the time). This is exactly the problem futexes solve.
+
+Futex = "Fast Userspace Mutex"
+
+The core idea: most of the time, a lock isn't contended - no one else is
+holding it. So don't make a syscall for the common case; only make a
+syscall when there's actually a conflict.
+
+A futex is a hybrid: a plain integer in user-space memory (shared between
+threads, no kernel involvement needed) plus a kernel-assisted queue for
+the rare case where a thread has to actually wait.
+
+    Fast path (no contention):
+      Thread checks the futex integer via CAS (compare-and-swap) - user-space
+      only, no syscall at all. If it succeeds in flipping 0 -> 1, lock
+      acquired instantly.
+
+    Slow path (contention):
+      If CAS fails (someone else already holds the lock), THEN the thread
+      makes a syscall: futex(WAIT, address, expected_value)
+      -> kernel puts thread into Blocked state, parks it on a wait queue
+         tied to that specific memory address.
+
+    Unlocking:
+      Lock holder sets the integer back to 0 (fast, user-space), then
+      checks if anyone is waiting; if so, calls futex(WAKE, address) ->
+      kernel wakes one blocked thread from the wait queue, moving it back
+      to Ready.
+
+                    +-------------------------+
+                    |   futex integer (0/1)   |  <- lives in user-space memory
+                    +-------------------------+
+                        |                  |
+             uncontended CAS       contended -> syscall
+             (no kernel needed)     |
+                                    v
+                          Kernel wait queue for this address
+                          [Thread B: Blocked] [Thread C: Blocked]
+
+This is why std::mutex in C++ (on Linux) or Java's synchronized/
+ReentrantLock are fast in the uncontended case - they're basically free
+(just an atomic CAS instruction), and only pay the "real" cost of a
+syscall + context switch when there's actual contention. This directly
+ties back to the TCB: a blocked thread's state changes to Blocked, its
+TCB is parked on the futex's wait queue, and a context switch happens to
+let another Ready thread run instead of wasting CPU spinning.
+
+Condition variables - same mechanism, different trigger
+
+A condition variable (std::condition_variable, used with a mutex for
+producer-consumer patterns) uses the same futex mechanism, but the "wake"
+trigger is a logical condition being met (e.g., "queue is no longer
+empty") rather than just "lock released."
+
+
+2. THREAD POOLS - REUSING TCBs AND STACKS
+-----------------------------------------------------
+
+The problem thread pools solve
+
+Creating a thread isn't free - from the earlier discussion:
+- OS allocates a new stack (often several hundred KB to a few MB,
+  depending on OS defaults).
+- OS creates a new TCB and registers it with the scheduler.
+- This all requires a syscall (clone() on Linux, CreateThread() on
+  Windows) - real kernel overhead, not just user-space bookkeeping.
+
+If your server creates a brand-new thread for every incoming request (the
+old "thread-per-request" model), and you get 10,000 requests/sec, you're
+constantly paying thread creation + teardown cost, plus you risk creating
+so many threads that context-switching overhead dominates (thousands of
+TCBs the scheduler has to juggle).
+
+The thread pool solution
+
+Instead, create a fixed number of threads once, up front (e.g., matching
+the number of CPU cores, or some tuned number based on I/O-wait ratio),
+and reuse them for many tasks over the thread pool's lifetime:
+
+    Thread Pool (created once, at startup)
+    +------------------------------------------+
+    |  Worker Thread 1  [TCB + stack, alive]    |
+    |  Worker Thread 2  [TCB + stack, alive]    |
+    |  Worker Thread 3  [TCB + stack, alive]    |
+    |  Worker Thread 4  [TCB + stack, alive]    |
+    +------------------------------------------+
+                  ^
+                  |  pulls tasks from
+    +------------------------------------------+
+    |   Task Queue: [Task A][Task B][Task C]... |
+    +------------------------------------------+
+                  ^
+                  |  pushed by
+            Incoming requests
+
+Each worker thread runs a loop conceptually like:
+
+    void workerLoop() {
+        while (true) {
+            Task task = taskQueue.pop();  // blocks (futex-based) if queue is empty
+            task.execute();               // does the actual work
+            // loop back - thread is NOT destroyed, just goes to get the next task
+        }
+    }
+
+Key insight: the TCB and stack for each worker thread are allocated once
+and never torn down between tasks. When a worker finishes Task A, its
+stack frame just unwinds (locals from Task A disappear) and it loops back
+to taskQueue.pop() - same TCB, same OS thread identity, same allocated
+stack memory, just reused for Task B, Task C, etc. You pay the
+thread-creation cost exactly once per worker, not once per task.
+
+Bounded queue = backpressure
+
+If tasks arrive faster than workers can process them, a bounded queue
+(fixed max size) causes the producer (whoever's submitting tasks) to
+block or reject new tasks once full - this is the "backpressure" concept
+from the earlier concurrency guide. Without a bound, an unbounded queue
+under heavy load just grows memory usage until the process runs out of
+memory.
+
+Sizing the pool
+
+- CPU-bound work (heavy computation): pool size approx. number of CPU
+  cores - more threads than cores just causes context-switch overhead
+  with no benefit, since cores are already saturated.
+- I/O-bound work (waiting on network/disk): pool size can be much larger
+  than core count, because threads spend most of their time Blocked
+  (waiting on I/O), not actually running - so many more threads than
+  cores can be "in flight" without hurting CPU utilization.
+
+
+3. ASYNC / EVENT-LOOP MODEL (NODE.JS) - AVOIDING THREADS ALMOST ENTIRELY
+-----------------------------------------------------
+
+The core idea: one thread, no blocking
+
+Instead of "one thread per request, blocked while waiting on I/O,"
+Node.js runs your JS code on a single thread and never lets that thread
+sit idle waiting for I/O. Whenever it would need to wait (reading a file,
+a DB query, an HTTP call), it hands the operation off and immediately
+moves on to other work, getting notified later when the result is ready.
+
+    Traditional thread-per-request model:
+      Thread 1: [handle req A] -> [BLOCKED waiting on DB] -> [resume, respond]
+      Thread 2: [handle req B] -> [BLOCKED waiting on DB] -> [resume, respond]
+      Thread 3: [handle req C] -> [BLOCKED waiting on DB] -> [resume, respond]
+      (3 threads, 3 TCBs, 3 stacks - 2 of them just sitting blocked, wasting
+      resources)
+
+    Node.js event-loop model:
+      Single thread:
+        [start req A: fire off DB query, register callback, move on]
+        [start req B: fire off DB query, register callback, move on]
+        [start req C: fire off DB query, register callback, move on]
+        ... loop keeps checking: "has any I/O completed?"
+        [DB result A ready -> run A's callback -> respond to A]
+        [DB result B ready -> run B's callback -> respond to B]
+
+How it physically works
+
+The actual I/O (reading from a socket, disk, DB connection) is delegated
+to the OS kernel (via non-blocking sockets, epoll on Linux) or, for
+things that can't be non-blocking (some file system calls), to a small
+internal thread pool Node maintains behind the scenes (libuv's thread
+pool - separate from your JS code, invisible to you).
+
+                    Your JS code (single thread, the "event loop")
+                              |
+                  +-----------+------------+
+                  |                        |
+         Non-blocking I/O            File system / CPU-heavy
+         (sockets, network)          (via libuv thread pool)
+                  |                        |
+                  v                        v
+            OS kernel (epoll)      A few background OS threads
+                  |                        |
+                  +-----------+------------+
+                              |
+                      Completion queue -> event loop picks up
+                      finished callbacks and executes them,
+                      one at a time, on the single main thread
+
+The event loop itself is just a while(true) loop that:
+1. Checks which pending I/O operations have completed.
+2. Runs their registered JS callbacks (one at a time - your JS callbacks
+   never run concurrently with each other, only one at a time on that
+   single thread).
+3. Repeats.
+
+Why this connects back to threads/TCBs
+
+There's technically still exactly one OS thread running your actual
+JavaScript logic - one TCB, one stack, one program counter - so you get
+concurrency (handling many in-flight requests) without the overhead of
+thread creation, context switching between many TCBs, or shared-heap
+race conditions between your own callbacks. Since your callbacks run
+one-at-a-time on a single thread, there's no need for mutexes/locks
+around your own JS state - the race conditions from earlier (multiple
+threads racing on a shared counter) simply can't happen within your JS
+code, because there's only ever one thread executing it.
+
+The tradeoff: if one callback does something CPU-heavy (a long
+synchronous loop, heavy computation), it blocks the entire event loop -
+no other request's callback can run until it finishes, since there's
+genuinely only one thread available for JS execution. This is why
+Node.js is praised for I/O-bound workloads (web servers waiting on
+DB/network) but considered a poor fit for CPU-bound workloads (image
+processing, heavy math) unless you offload that work to worker threads
+or separate processes.
+
+
+SIDE-BY-SIDE SUMMARY
+-----------------------------------------------------
+                      Thread-per-request     Thread pool            Event loop (Node.js)
+Threads used          One per request         Fixed, reused          One (for your JS) +
+                       (unbounded)                                    hidden helper threads
+                                                                       for some I/O
+Blocking on I/O       Thread sits Blocked,    Worker sits Blocked,    Never blocks - I/O
+                       wasting a TCB/stack     but pool is small/      delegated, callback
+                                                bounded                 fires on completion
+Race conditions on    Yes - needs mutexes     Yes - needs mutexes     No, for your own JS
+shared state                                                          logic (single-threaded
+                                                                       execution)
+Best for              Rarely used today       CPU-bound work,         I/O-bound work (web
+                       (too costly at scale)   bounded concurrency     servers, APIs)
+Weakness              Doesn't scale (creation  Fixed capacity - long  One long CPU-bound
+                       cost + context switch    tasks can starve       callback blocks
+                       overhead)                queue                  everything
+
+
+
+
+
+CONDITION VARIABLES - COMPLETE THEORY
+========================================
+
+
+PART 1: CONDITION VARIABLES - FROM FIRST PRINCIPLES
+========================================
+
+THE PROBLEM: WAITING FOR SOMETHING TO BECOME TRUE
+-----------------------------------------------------
+A mutex answers one question: "Can I have exclusive access right now?" It
+has no concept of waiting for a condition - it only knows locked/unlocked.
+
+But very often, a thread doesn't just want exclusive access - it wants to
+wait until some condition about shared data becomes true, and only then
+proceed. For example:
+
+- "Wait until this queue has an item in it."
+- "Wait until this flag becomes true."
+- "Wait until the buffer has space."
+- "Wait until all worker threads have finished."
+
+A mutex alone can't express "wait until." You could try to fake it with a
+loop:
+
+    while (!conditionIsTrue) {
+        // keep checking...
+    }
+
+This is called busy-waiting (or spin-waiting), and it's a real problem:
+
+1. It burns 100% of a CPU core the entire time the thread is waiting,
+   doing nothing useful - pure wasted cycles.
+2. If you try to protect the check with a mutex (since conditionIsTrue is
+   shared state), you'd need to lock/unlock repeatedly in the loop - and
+   while you hold the lock to check, no other thread can update the
+   condition, so you might prevent the very thing you're waiting for from
+   ever happening.
+
+What you actually want: the thread should go to sleep (consuming zero
+CPU) and get woken up automatically exactly when the condition might have
+changed - not before, not via wasteful polling. That's precisely what a
+condition variable provides.
+
+
+WHAT A CONDITION VARIABLE ACTUALLY IS
+-----------------------------------------------------
+A condition variable is a synchronization primitive that lets a thread:
+
+1. Atomically release a mutex it's holding, and go to sleep - in one
+   indivisible step.
+2. Be woken up later by another thread (which calls notify), at which
+   point it automatically re-acquires the mutex before continuing.
+
+It does NOT hold any data or represent the condition itself - a condition
+variable knows nothing about queues, flags, or counters. It is purely a
+signaling mechanism: "let some thread(s) sleep here, and let another
+thread wake them up when something worth checking has happened." The
+actual condition (e.g., "queue is not empty") is just an ordinary piece
+of shared data that you check yourself, protected by the mutex.
+
+
+THE TWO CORE OPERATIONS
+-----------------------------------------------------
+
+wait(mutex)
+
+Called by a thread that wants to pause until notified. Internally, as one
+atomic unit:
+
+    wait(mutex):
+        1. Release the mutex
+        2. Put this thread on the condition variable's internal wait queue
+        3. Block this thread (it consumes no CPU while blocked)
+        ... time passes, thread is asleep ...
+        4. When woken (by notify): re-acquire the mutex
+        5. Return control to the caller
+
+The reason steps 1-3 must be one atomic operation, not three separate
+steps a programmer writes by hand, is subtle but critical - covered
+below.
+
+notify_one() / notify_all()
+
+Called by a thread that just changed the shared state in some way that
+might matter to a waiter:
+
+    notify_one():
+        wake up ONE thread currently sleeping on this condition variable
+        (moves it from Blocked to Ready - it still needs to re-acquire
+        the mutex before it can actually resume running)
+
+    notify_all():
+        wake up ALL threads currently sleeping on this condition variable
+
+Calling notify does NOT release the mutex on its own - the notifying
+thread typically still holds the mutex until its own critical section
+ends, and the woken thread(s) will simply queue up to acquire it once
+it's free.
+
+
+WHY "RELEASE + SLEEP" MUST BE ATOMIC - THE LOST WAKEUP PROBLEM
+-----------------------------------------------------
+This is the single most important reason condition variables exist as a
+dedicated primitive rather than something you'd build yourself from a
+mutex and a manual sleep call.
+
+Imagine, hypothetically, that "release the mutex" and "go to sleep" were
+two separate steps you had to code by hand:
+
+    Thread A (waiter):
+      1. mtx.unlock()
+      -- [gets paused right here by the OS scheduler, before step 2] --
+      2. goToSleep()   <- not reached yet!
+
+    Thread B (notifier), running in that gap:
+      1. mtx.lock()            -- succeeds, A already unlocked
+      2. update the condition   -- e.g., push an item onto the queue
+      3. notify()               -- but A isn't asleep yet! Nothing is
+                                   listening. This notify is silently lost.
+      4. mtx.unlock()
+
+    Thread A resumes:
+      2. goToSleep()   -- NOW it sleeps, but the notify already happened
+                          and is gone forever. A sleeps forever, even
+                          though the condition it wanted is already true.
+
+This is called a lost wakeup - a fatal bug where a thread waits forever
+because the signal telling it to wake up arrived a moment too early,
+before it was actually listening.
+
+Condition variables solve this by guaranteeing that "release the mutex"
+and "register as a waiter + go to sleep" happen as one indivisible
+operation, with no gap where a race like this can occur. Any notify()
+that happens after a thread has called wait() (i.e., after it's genuinely
+parked and listening) is guaranteed to be seen by that thread - there's
+no window where a notify can slip through unnoticed. This is enforced by
+the OS at a low level (on Linux, this coordination is built on the same
+futex mechanism used by mutexes/semaphores - the wait queue and the
+mutex handoff are managed together so the "unlock + sleep" transition
+can't be interrupted).
+
+
+WHY YOU MUST RECHECK THE CONDITION AFTER WAKING
+-----------------------------------------------------
+A condition variable's wait() doesn't know or care what the "condition"
+actually is - it's just a sleep/wake mechanism. This means when a thread
+wakes up from wait(), it must explicitly recheck the condition itself
+before proceeding - you never assume "I was woken up, so the condition
+must be true now." There are two distinct reasons for this:
+
+1. Spurious wakeups
+
+Some condition variable implementations are allowed (by specification) to
+occasionally wake a waiting thread even when nobody called notify() -
+this is a quirk of how they're implemented at the OS level in some
+environments. So a thread might simply wake up for no real reason, and
+the condition it cares about might still be false.
+
+2. Multiple waiters racing
+
+If several threads are all waiting on the same condition variable, and
+one gets woken by notify_one(), there's no guarantee that by the time it
+re-acquires the mutex and looks around, the condition is still true -
+another thread might have gotten there first and already consumed
+whatever became available.
+
+Because of both of these, the correct usage pattern is always a loop, not
+a one-time check:
+
+    lock(mtx)
+    while (!conditionIsTrue) {
+        conditionVariable.wait(mtx)     // atomically: unlock, sleep, relock on wake
+    }
+    // condition is now verified true, and we hold the lock
+    ... proceed safely ...
+    unlock(mtx)
+
+Many libraries provide a convenience form that bakes this loop in for you
+(a "wait with predicate"), but under the hood it's always doing this same
+while-loop-recheck pattern.
+
+
+PUTTING IT ALL TOGETHER - A MINIMAL MENTAL MODEL
+-----------------------------------------------------
+    Shared state: bool dataReady = false;
+    Mutex: mtx
+    Condition variable: cv
+
+    Waiting thread:
+        lock(mtx)
+        while (!dataReady) {
+            cv.wait(mtx)      // releases mtx, sleeps; re-acquires mtx when woken
+        }
+        // dataReady is true, mtx is held
+        useData()
+        unlock(mtx)
+
+    Signaling thread:
+        lock(mtx)
+        prepareData()
+        dataReady = true
+        cv.notify_one()       // wake the waiter (doesn't release mtx itself)
+        unlock(mtx)
+
+Notice: the condition (dataReady) is a completely ordinary shared
+boolean, protected by the ordinary mutex like any other shared state. The
+condition variable's only job is to let the waiting thread sleep
+efficiently instead of busy-looping, and to guarantee it wakes up
+reliably (no lost wakeups) once the signaling thread has made the
+condition true.
+
+
+SUMMARY TABLE
+-----------------------------------------------------
+Purpose                 Let a thread sleep (zero CPU) until a shared
+                        condition might have changed, instead of
+                        busy-waiting
+Not                     A container for data or the condition itself -
+                        purely a sleep/wake signaling mechanism
+wait(mutex)             Atomically: release the mutex, sleep, and later
+                        re-acquire the mutex upon waking
+notify_one()/           Wake one or all threads sleeping on this
+notify_all()            condition variable
+Why atomicity matters   Prevents the "lost wakeup" race, where a notify
+                        happens in the gap between unlocking and
+                        actually going to sleep
+Why recheck after       Guards against spurious wakeups and against
+waking                  other threads consuming the resource first
+                        (multiple-waiter race)
+Always paired with      A mutex (to protect the actual shared
+                        condition/data) and a loop (while, not if)
+                        around the wait call
+
+
+PART 2: CONDITION VARIABLES APPLIED - THE BLOCKING QUEUE put() EXAMPLE
+========================================
+
+    void put(T item) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        notFull_.wait(lock, [this] { return queue_.size() < capacity_; });
+        queue_.push(std::move(item));
+        notEmpty_.notify_one(); // wake up one waiting consumer, if any
+    }
+
+WHY unique_lock, NOT lock_guard
+-----------------------------------------------------
+std::unique_lock is used instead of std::lock_guard specifically because
+unique_lock supports being unlocked and relocked, which wait() needs to
+do internally. lock_guard locks once at construction and unlocks once at
+destruction - no ability to unlock partway through, so it can't be used
+with wait().
+
+LINE-BY-LINE
+-----------------------------------------------------
+1. std::unique_lock<std::mutex> lock(mtx_);
+   Acquires the mutex. The calling thread now holds mtx_ exclusively - no
+   other thread can touch queue_.
+
+2. notFull_.wait(lock, [this] { return queue_.size() < capacity_; });
+   This is shorthand for:
+
+       while (!predicate()) {
+           notFull_.wait(lock);   // the "raw" wait, no predicate
+       }
+
+   The raw wait(lock) does, atomically:
+       a. Release the mutex (mtx_.unlock())
+       b. Register this thread on the condition variable's internal wait
+          queue
+       c. Put this thread to sleep (Running -> Blocked)
+   Then, upon being woken (by notify_one/notify_all elsewhere):
+       a. Re-acquire the mutex (mtx_.lock()) - may itself have to wait if
+          someone else grabbed mtx_ first
+       b. Return control back to wait()
+   The wrapper then rechecks queue_.size() < capacity_. If still false,
+   it waits again. If true, wait() returns and execution continues to
+   the next line, still holding the lock.
+
+3. queue_.push(std::move(item));
+   Safe because the predicate was true at the moment of return, and the
+   thread holds mtx_ again after waking.
+
+4. notEmpty_.notify_one();
+   Wakes up one thread blocked in notEmpty_.wait(...) inside take() - a
+   consumer waiting because the queue was empty. This is a DIFFERENT
+   condition variable than the one put() itself waited on (notFull_).
+   notify_one() does not release the mutex - that happens automatically
+   when the unique_lock goes out of scope at the end of put().
+
+WHY TWO CONDITION VARIABLES (notFull_ AND notEmpty_)
+-----------------------------------------------------
+A condition variable is tied to one specific wait condition, not to the
+mutex itself - the mutex can be shared across many condition variables,
+but each condition variable represents a distinct "thing to wait for":
+
+- notFull_  - "wake me when there might be room" (checked by producers)
+- notEmpty_ - "wake me when there might be an item" (checked by
+              consumers)
+
+Both share the same mtx_ because both protect the same underlying data
+(queue_) - but they're separate "wait channels" so a producer waiting for
+space isn't woken up uselessly every time an item is merely added.
+
+FULL STATE TRANSITION EXAMPLE
+-----------------------------------------------------
+    Producer calls put() on a FULL queue:
+
+      Running -> [acquire mtx_] -> Running (holding lock)
+              -> [wait(): release mtx_ + register + sleep, ATOMICALLY] -> Blocked
+              -> ... time passes ...
+      Consumer calls take(), pops an item, calls notFull_.notify_one()
+              -> Blocked -> Ready (woken, but must still get the mutex)
+              -> [re-acquire mtx_] -> Running (holding lock again)
+              -> [recheck predicate: now true] -> proceeds past wait()
+              -> push item, notify_one() on notEmpty_
+              -> [unique_lock destructor releases mtx_] -> done
+
+
+PART 3: A FULL REAL EXAMPLE OF SPIN-WAITING (BUSY-WAITING)
+========================================
+
+This example shows exactly what busy-waiting looks like in practice, and
+why it's wasteful - this is the naive alternative that condition
+variables are designed to replace.
+
+    #include <iostream>
+    #include <thread>
+    #include <atomic>
+    #include <chrono>
+
+    std::atomic<bool> dataReady(false);   // shared flag, must be atomic -
+                                            // a plain bool here would itself
+                                            // be a data race
+    int sharedData = 0;
+
+    // ---- Consumer: spin-waits (busy-waits) for dataReady to become true ----
+    void consumer() {
+        std::cout << "Consumer: waiting for data...\n";
+
+        // THIS is the spin-wait / busy-wait loop
+        while (!dataReady.load()) {
+            // keep checking, over and over, as fast as possible
+            // -- this burns 100% of a CPU core doing nothing useful
+        }
+
+        std::cout << "Consumer: data is ready! Value = " << sharedData << "\n";
+    }
+
+    // ---- Producer: does some "work," then sets the flag ----
+    void producer() {
+        std::cout << "Producer: preparing data...\n";
+        std::this_thread::sleep_for(std::chrono::seconds(3));  // simulate work
+
+        sharedData = 42;
+        dataReady.store(true);   // signal the consumer
+
+        std::cout << "Producer: data is ready, flag set.\n";
+    }
+
+    int main() {
+        std::thread t1(consumer);
+        std::thread t2(producer);
+
+        t1.join();
+        t2.join();
+
+        return 0;
+    }
+
+WHAT HAPPENS WHEN YOU RUN THIS
+-----------------------------------------------------
+    Consumer: waiting for data...
+    Producer: preparing data...
+    (... 3 full seconds pass ...)
+    Producer: data is ready, flag set.
+    Consumer: data is ready! Value = 42
+
+WHAT'S ACTUALLY HAPPENING ON YOUR CPU DURING THOSE 3 SECONDS
+-----------------------------------------------------
+While the producer is "preparing data" (sleeping for 3 seconds to
+simulate work), the consumer thread is stuck in
+while (!dataReady.load()), executing that check millions of times per
+second, continuously. If you opened a system monitor (Task Manager, top,
+Activity Monitor) while this runs, you'd see one entire CPU core pinned
+at 100% usage for those 3 seconds - doing absolutely nothing productive,
+just repeatedly asking "is it ready yet? is it ready yet? is it ready
+yet?"
+
+    CPU core running the consumer thread, over those 3 seconds:
+
+    Time:     0ms   1ms   2ms   3ms   ...   3000ms
+    Core:     [check][check][check][check]...[check][exits loop]
+              100% busy the entire time, doing pure polling
+
+Compare this to the condition-variable version, where the consumer would
+be in the Blocked state for those 3 seconds - consuming 0% CPU - and only
+wake up the instant the producer calls notify().
+
+A VERSION THAT SHOWS THE WASTED WORK EXPLICITLY
+-----------------------------------------------------
+    #include <iostream>
+    #include <thread>
+    #include <atomic>
+    #include <chrono>
+
+    std::atomic<bool> dataReady(false);
+    std::atomic<long long> spinCount(0);   // count how many times we looped
+
+    void consumer() {
+        while (!dataReady.load()) {
+            spinCount.fetch_add(1);   // count each wasted check
+        }
+        std::cout << "Consumer: woke up after spinning "
+                  << spinCount.load() << " times\n";
+    }
+
+    void producer() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        dataReady.store(true);
+    }
+
+    int main() {
+        std::thread t1(consumer);
+        std::thread t2(producer);
+        t1.join();
+        t2.join();
+    }
+
+On a typical modern machine, this will print something like:
+
+    Consumer: woke up after spinning 1834529201 times
+
+That's over a billion wasted iterations checking a flag that didn't
+change for 2 whole seconds - all while occupying a full CPU core that
+could have been doing real work (or, if no other work is available,
+could have let the OS put the core into a low-power state).
+
+WHY dataReady HAS TO BE std::atomic<bool> HERE, NOT A PLAIN bool
+-----------------------------------------------------
+This is worth noting explicitly: even though this loop has no mutex at
+all, dataReady still must be atomic. If it were a plain bool:
+
+1. Data race - the compiler/CPU has no obligation to make the producer's
+   write visible to the consumer's read in a timely (or even eventual!)
+   way. The compiler is technically permitted to assume a plain,
+   non-atomic variable isn't being changed by another thread, and could
+   optimize the loop into "if (!dataReady) { while(true); }" - checking
+   it exactly once and looping forever, since nothing in single-threaded
+   semantics says it needs to recheck memory.
+2. Undefined behavior - the C++ standard defines a plain, unsynchronized
+   read/write from different threads on the same variable as undefined
+   behavior outright, regardless of what actually happens on your
+   hardware.
+
+std::atomic<bool> guarantees both: an indivisible read/write (no torn
+values), and proper memory visibility between threads (via memory
+ordering guarantees) - but notice it does NOTHING to prevent the
+CPU-burning loop itself. Atomics fix the race condition; they don't fix
+the busy-waiting inefficiency. That's a completely separate problem,
+solved specifically by condition variables (or, at the hardware level,
+spinlocks that fall back to blocking after a short spin - a further
+refinement).
+
+SIDE-BY-SIDE: THIS SAME PROBLEM SOLVED WITHOUT SPINNING
+-----------------------------------------------------
+    #include <iostream>
+    #include <thread>
+    #include <mutex>
+    #include <condition_variable>
+    #include <chrono>
+
+    bool dataReady = false;     // plain bool is fine now - protected by mtx
+    std::mutex mtx;
+    std::condition_variable cv;
+    int sharedData = 0;
+
+    void consumer() {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [] { return dataReady; });   // sleeps - 0% CPU while waiting
+        std::cout << "Consumer: data ready! Value = " << sharedData << "\n";
+    }
+
+    void producer() {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            sharedData = 42;
+            dataReady = true;
+        }
+        cv.notify_one();   // wakes the consumer instantly, no polling needed
+    }
+
+    int main() {
+        std::thread t1(consumer);
+        std::thread t2(producer);
+        t1.join();
+        t2.join();
+    }
+
+Same outcome, same 3-second wait - but the consumer's CPU core sits idle
+(0% usage) the entire time instead of spinning at 100%, and it still
+wakes up essentially immediately (microseconds, not a polling interval)
+once the producer signals - this is exactly the efficiency condition
+variables were built to provide.

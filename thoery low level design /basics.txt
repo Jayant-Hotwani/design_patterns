@@ -1,0 +1,293 @@
+Design Principles for Low-Level Design (LLD)
+
+============================================================ 1. KISS
+(Keep It Simple, Stupid)
+============================================================
+
+Definition
+
+The KISS principle states that software should be as simple as possible
+while still meeting the current requirements. Whenever multiple
+solutions exist, choose the simplest one that works.
+
+KISS does NOT mean writing simplistic or poor-quality code. It means
+avoiding unnecessary abstractions, design patterns, inheritance, or
+optimization until they are actually needed.
+
+Why KISS Exists
+
+-   Simple code is easier to read.
+-   Easier to debug.
+-   Easier to maintain.
+-   Easier to test.
+-   New developers understand it quickly.
+-   Fewer bugs.
+
+Example
+
+Bad: A system supports only Credit Card payments but the developer
+creates: - PaymentFactory - PaymentStrategy - PaymentContext -
+AbstractPayment
+
+This is unnecessary complexity.
+
+Good:
+
+class PaymentService { public void pay(double amount) { // Process
+payment } }
+
+Advantages
+
+-   Better readability
+-   Faster development
+-   Easier testing
+-   Lower maintenance cost
+-   Fewer bugs
+
+Disadvantages
+
+If followed blindly, it may delay introducing useful abstractions when
+the system grows.
+
+Interview Tip
+
+Start with the simplest design. Refactor only when new requirements
+justify additional complexity.
+
+============================================================ 2. DRY
+(Don’t Repeat Yourself)
+============================================================
+
+Definition
+
+Every piece of knowledge or business logic should have only one
+representation in the system.
+
+Avoid copying the same code into multiple places. Instead, create
+reusable methods, utilities, or services.
+
+Why DRY Exists
+
+Duplicate code increases maintenance effort.
+
+If tax calculation changes from 18% to 20%, updating one method is much
+easier than updating multiple classes.
+
+Example
+
+Bad:
+
+double tax = salary * 0.18;
+
+appears in: - PayrollService - InvoiceService - EmployeeService
+
+Good:
+
+class TaxCalculator { public double calculateTax(double amount) { return
+amount * 0.18; } }
+
+Advantages
+
+-   Less maintenance
+-   Consistent logic
+-   Easier updates
+-   Easier testing
+-   Reduced bugs
+
+Disadvantages
+
+Overusing DRY may create unnecessary abstractions and tight coupling.
+
+Interview Tip
+
+Extract common logic only after duplication becomes meaningful.
+
+============================================================ 3. YAGNI
+(You Aren’t Gonna Need It)
+============================================================
+
+Definition
+
+Implement only the functionality required today. Do not build features
+simply because they might be needed in the future.
+
+Why YAGNI Exists
+
+Unused features: - Increase development time - Increase testing effort -
+Increase maintenance cost - Add unnecessary complexity
+
+Example
+
+Requirement: Only Email Login
+
+Wrong: Implement Email, Google, Facebook, Twitter, LinkedIn login.
+
+Correct: Implement only Email Login. Add other providers only when
+requested.
+
+Advantages
+
+-   Faster development
+-   Less maintenance
+-   Simpler code
+-   Lower technical debt
+
+Disadvantages
+
+Should not be confused with writing inflexible code. Design for
+extension but implement only current requirements.
+
+Interview Tip
+
+Implement current requirements first. Discuss future extensions only if
+the interviewer asks.
+
+============================================================ 4.
+Separation of Concerns (SoC)
+============================================================
+
+Definition
+
+Different parts of the application should have different
+responsibilities.
+
+Each class or module should focus on one concern.
+
+Example
+
+Bad: One TicTacToe class: - Reads input - Displays board - Checks
+winner - Stores board - Controls game
+
+Good: Board - Stores game state
+
+Display - Renders board
+
+InputHandler - Reads user input
+
+Game - Coordinates gameplay
+
+Advantages
+
+-   Easier maintenance
+-   Better modularity
+-   Easier testing
+-   Lower coupling
+-   Better code organization
+
+Disadvantages
+
+Too much separation can create too many small classes.
+
+Interview Tip
+
+Separate: - Presentation Layer - Business Layer - Data Access Layer
+
+============================================================ 5. Law of
+Demeter (Principle of Least Knowledge)
+============================================================
+
+Definition
+
+A class should communicate only with its immediate collaborators.
+
+Avoid navigating through long chains of objects.
+
+Bad Example
+
+order.getCustomer().getAddress().getZipCode();
+
+This exposes the internal structure of multiple objects.
+
+Good Example
+
+order.getCustomerZipCode();
+
+The Order class internally retrieves the ZIP code.
+
+Advantages
+
+-   Lower coupling
+-   Better encapsulation
+-   Easier refactoring
+-   Cleaner APIs
+
+Disadvantages
+
+May require additional wrapper methods.
+
+Interview Tip
+
+Expose high-level methods instead of internal object structures.
+
+============================================================ Quick
+Comparison ============================================================
+
+KISS - Keep the solution simple.
+
+DRY - Avoid duplicate logic.
+
+YAGNI - Build only what is needed today.
+
+Separation of Concerns - Give each component one responsibility.
+
+Law of Demeter - Talk only to immediate collaborators.
+
+============================================================ Interview
+Summary ============================================================
+
+1.  Start with a simple design (KISS).
+2.  Remove duplicate logic when necessary (DRY).
+3.  Avoid speculative features (YAGNI).
+4.  Separate responsibilities into different layers (Separation of
+    Concerns).
+5.  Reduce coupling by hiding object internals (Law of Demeter).
+
+Together, these principles help create software that is easier to
+understand, maintain, test, and extend.
+
+
+
+Encapsulation is the OOP principle of bundling data and the methods that operate on it into a single class 
+while restricting direct access to the object's internal state. 
+The goal is to protect object invariants, expose behavior instead of raw data, 
+and ensure that all state changes go through controlled methods.
+In C++, this is typically achieved using private data members, public methods, 
+and by avoiding direct exposure of mutable internal objects.
+
+Abstraction is the OOP principle of hiding implementation details while exposing only the essential functionality 
+through a simple interface. It allows users to interact with an object without knowing its internal workings. 
+In C++, abstraction is typically achieved using abstract classes and pure virtual functions, 
+although any well-designed API that hides complexity is an example of abstraction. 
+The main goal is to reduce complexity, improve maintainability, 
+and decouple clients from implementation details.
+
+Inheritance is the OOP mechanism that allows a derived class to inherit the properties 
+and behavior of a base class, representing an IS-A relationship. 
+It promotes code reuse and enables polymorphism. 
+However, inheritance should only be used when the relationship is logically correct 
+and satisfies the Liskov Substitution Principle.
+If the relationship is HAS-A, composition is usually the better choice.
+
+Inheritance models an IS-A relationship, where a derived class inherits the state and behavior of a base class. 
+It is useful when there is a true specialization, such as Dog being an Animal. 
+Composition models a HAS-A relationship, where one class contains another as a member, 
+such as a Car having an Engine. 
+Composition generally results in looser coupling 
+and greater flexibility because contained objects can often be replaced or varied independently. 
+As a result, modern object-oriented design typically favors composition over inheritance 
+unless there is a clear IS-A relationship.
+
+
+
+One Important Correction
+
+A common misconception is:
+
+"Composition is always better than inheritance."
+
+This is not true.
+
+The correct guideline is:
+
+Use inheritance for true IS-A relationships and composition for HAS-A relationships. 
+Favor composition when inheritance is being used only for code reuse rather than to model a genuine specialization.
