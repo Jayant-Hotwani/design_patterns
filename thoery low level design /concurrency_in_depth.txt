@@ -1,0 +1,1379 @@
+THE THREE CONCURRENCY PROBLEM TYPES - FULL DEEP DIVE
+========================================================
+
+Let's go through each one exhaustively - the mechanics of why it happens,
+the full toolbox for fixing it, and multiple worked examples so the
+pattern really sticks.
+
+
+1. CORRECTNESS PROBLEMS
+========================================================
+
+WHAT'S ACTUALLY GOING WRONG
+-----------------------------------------------------
+Correctness problems occur whenever multiple threads read and write the
+same shared memory location(s), and the order in which their individual
+operations get interleaved changes the outcome. The defining feature:
+each thread's code is individually correct - the bug only exists in the
+space between instructions, where another thread can sneak in.
+
+The anatomy of a race condition
+
+Almost every correctness bug is a variation of "check-then-act" or
+"read-modify-write":
+
+    CHECK-THEN-ACT:
+      Thread A: if (seatAvailable) { ... }     <- CHECK
+      Thread A: ... book it ...                 <- ACT
+      (another thread can run its own CHECK before A's ACT completes)
+
+    READ-MODIFY-WRITE:
+      Thread A: temp = counter        <- READ
+      Thread A: temp = temp + 1       <- MODIFY
+      Thread A: counter = temp        <- WRITE
+      (another thread's entire R-M-W sequence can happen in between)
+
+Even something as innocent-looking as counter++ is really three CPU
+steps, and there is no language-level guarantee that they happen
+atomically unless you explicitly make them so.
+
+Worked example: the seat-booking bug
+
+    Initial state: seatAvailable = true
+
+    Time  Thread A                      Thread B
+    ----  -----------------------      -----------------------
+    t0    read seatAvailable -> true
+    t1                                  read seatAvailable -> true
+    t2    write seatAvailable = false
+    t3    book seat for A
+    t4                                  write seatAvailable = false
+    t5                                  book seat for B (BUG! already booked)
+
+Both threads believed the seat was free because both read the flag
+before either one wrote to it. The bug isn't in the logic -
+"if (available) book()" is completely correct in a single-threaded
+world. The bug is that two threads executed this correct logic
+concurrently, and nothing prevented their operations from interleaving
+badly.
+
+The fix: make check-then-act indivisible relative to other threads
+
+    std::mutex mtx;
+    bool seatAvailable = true;
+
+    void bookSeat() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (seatAvailable) {
+            seatAvailable = false;
+            performBooking();
+        }
+    }
+
+Now, whichever thread acquires mtx first performs the entire
+check-and-act sequence before the other thread can even begin its check.
+There's no window for interleaving anymore - the critical section is
+opaque to other threads; they either see it "not yet started" or "fully
+finished," never partial.
+
+THE TOOLBOX FOR CORRECTNESS PROBLEMS
+-----------------------------------------------------
+
+a) Coarse-grained locking
+One lock guards a large chunk of state (or an entire object). Simple,
+always correct, but can become a throughput bottleneck since unrelated
+operations serialize unnecessarily.
+
+    class Account {
+        std::mutex mtx;
+        double balance;
+        void deposit(double amt) { std::lock_guard<std::mutex> l(mtx); balance += amt; }
+        void withdraw(double amt) { std::lock_guard<std::mutex> l(mtx); balance -= amt; }
+    };
+
+b) Fine-grained locking
+Separate locks for separate pieces of independent state - improves
+concurrency, but introduces deadlock risk if multiple locks must be
+acquired together in inconsistent orders.
+
+    void transfer(Account& from, Account& to, double amt) {
+        std::lock(from.mtx, to.mtx);  // acquires BOTH atomically, avoiding deadlock
+        std::lock_guard<std::mutex> l1(from.mtx, std::adopt_lock);
+        std::lock_guard<std::mutex> l2(to.mtx, std::adopt_lock);
+        from.balance -= amt;
+        to.balance += amt;
+    }
+
+(std::lock here acquires multiple mutexes together using a
+deadlock-avoidance algorithm - this directly addresses the classic
+"Thread 1 locks A-then-B, Thread 2 locks B-then-A" deadlock.)
+
+c) Read-write locks
+When reads vastly outnumber writes and reads don't conflict with each
+other, a plain mutex over-serializes. A std::shared_mutex lets many
+readers proceed concurrently, only blocking for exclusive writer access.
+
+d) Atomics / CAS (lock-free)
+For a single variable (a counter, a flag, a pointer), a full mutex can be
+overkill. Compare-and-swap gives you correctness without ever blocking a
+thread - "loser" threads simply retry with fresh data instead of waiting
+in a queue. Only appropriate when the critical section really is just one
+variable; trying to coordinate multiple related atomics without a lock
+reintroduces the exact same class of race conditions at a higher level.
+
+e) Optimistic concurrency (version numbers)
+Especially common at the database layer: read a row along with its
+version number, compute changes without holding any lock, then write
+back conditionally (UPDATE ... WHERE version = 5). If another writer got
+there first, the write affects zero rows, and you retry. Good when
+conflicts are rare - avoids holding locks during potentially slow
+application-side computation.
+
+RECOGNIZING CORRECTNESS PROBLEMS IN INTERVIEW PROMPTS
+-----------------------------------------------------
+Look for language implying two actors could simultaneously act on the
+same piece of truth: "double-booked," "overselling," "lost update,"
+"duplicate charge," "inconsistent balance," "two threads incrementing the
+same counter." The fix is always some form of making the offending
+sequence atomic - via locking, CAS, or optimistic retries - never about
+waiting or resource limits (those are the next two categories).
+
+
+2. COORDINATION PROBLEMS
+========================================================
+
+WHAT'S ACTUALLY GOING WRONG
+-----------------------------------------------------
+Coordination problems aren't about data getting corrupted - the data
+itself might be perfectly safe (properly locked). The problem is about
+timing: one thread's ability to make progress depends on another thread
+doing something first, and naive approaches to "waiting for that to
+happen" are either wasteful (busy-waiting) or outright broken (lost
+wakeups).
+
+Why this is a genuinely different problem from correctness
+
+Contrast the two directly:
+
+    Correctness: "Two threads must NOT do X to the same data at the same time."
+    Coordination: "Thread B must NOT proceed until Thread A has done Y -
+                   and Thread B should not waste resources while waiting."
+
+A mutex alone answers "can I have exclusive access right now?" - it has
+no concept of "wait until a condition, which might not be true yet,
+becomes true." If you tried to solve a coordination problem with only a
+mutex, you'd be forced into the busy-waiting anti-pattern:
+
+    while (true) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!queue.empty()) break;
+        // have to unlock and try again - wasteful spinning, and note the
+        // awkwardness of even writing this loop correctly with just a mutex
+    }
+
+This burns 100% of a CPU core the entire time nothing is available, and -
+as covered in depth earlier - the fix isn't "check less often," it's a
+fundamentally different primitive that lets a thread sleep until woken,
+consuming zero CPU while idle.
+
+The lost wakeup danger
+
+Naively hand-rolling "release lock, then sleep" as two separate steps
+introduces a genuine correctness bug on top of the inefficiency: if a
+notify happens in the tiny gap between "I released the lock" and "I
+actually started sleeping," that notify is lost forever, and the waiting
+thread sleeps indefinitely even though the condition it wanted became
+true. This is why coordination requires a dedicated primitive (a
+condition variable) that guarantees "release + register as waiter +
+sleep" happens as one atomic, uninterruptible unit.
+
+THE TOOLBOX FOR COORDINATION PROBLEMS
+-----------------------------------------------------
+
+a) Condition variables
+The core primitive - wait() atomically releases a mutex and sleeps;
+notify_one()/notify_all() wakes waiters, who then reacquire the mutex and
+recheck their condition (protecting against spurious wakeups and
+multiple-waiter races):
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool workReady = false;
+
+    // Waiter
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait(lock, [] { return workReady; });   // sleeps until notified AND condition true
+
+    // Signaler
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        workReady = true;
+    }
+    cv.notify_one();
+
+b) Blocking queues (built from condition variables)
+The most common concrete data structure for coordination - bundles a
+mutex (protecting the queue itself) with two condition variables
+(notEmpty_ for consumers, notFull_ for producers, as built out earlier):
+
+    void put(T item) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        notFull_.wait(lock, [this] { return queue_.size() < capacity_; });
+        queue_.push(std::move(item));
+        notEmpty_.notify_one();
+    }
+
+This is the go-to structure for any producer-consumer scenario: task
+queues, thread pool work queues, event/message pipelines.
+
+c) Backpressure via bounded queues
+A subtler coordination concern: if producers outrun consumers
+indefinitely, an unbounded queue just grows memory without limit. A
+bounded blocking queue makes put() block once full, which naturally
+throttles the producer to match the consumer's real processing rate -
+coordination isn't just "wait for work to exist," it's also "wait for
+the system to have capacity to accept more work."
+
+d) Barriers and rendezvous points
+"Wait until all N threads reach this point before any of them proceeds" -
+a different flavor of coordination (fan-in rather than producer/consumer
+hand-off), typically built with a counter + condition variable, or
+std::barrier in modern C++.
+
+e) One-time initialization signals
+"Wait until setup is complete, exactly once" - often std::call_once, or a
+simple boolean + condition variable pattern, used when many threads need
+to wait for a single piece of shared initialization before proceeding.
+
+f) Graceful shutdown signaling
+A real-world coordination wrinkle: how do you tell all waiting consumers
+to stop waiting and exit, rather than waiting for work forever? This is
+why notify_all() exists distinctly from notify_one() - a shutdown flag
+change needs to wake every waiter so each can check the flag and exit,
+not just one.
+
+RECOGNIZING COORDINATION PROBLEMS IN INTERVIEW PROMPTS
+-----------------------------------------------------
+Look for language implying one thread's progress is gated on another
+thread's action or on some system state becoming true: "producer adds
+tasks, consumers process them," "wait for the job to finish," "notify
+when data arrives," "process events as they come in," "wait until
+shutdown." The fix is never about serializing access to prevent
+corruption (that's correctness) - it's about efficient, correct waiting
+and signaling.
+
+
+3. SCARCITY PROBLEMS
+========================================================
+
+WHAT'S ACTUALLY GOING WRONG
+-----------------------------------------------------
+Scarcity problems are conceptually the simplest of the three in one
+sense: there's no data race, no waiting-for-an-event - there's just a
+hard numeric ceiling on how many things can use some resource
+simultaneously, and demand exceeds that ceiling.
+
+    100 concurrent requests want a database connection
+    Only 10 database connections actually exist
+    -> at most 10 can be "in use" at any instant; the other 90 must wait
+       their turn, in some order, until a connection frees up
+
+Note what's not the problem here: the database connections themselves
+aren't being corrupted by concurrent access (each request gets its own
+connection object once granted one) - the issue is purely about counting
+and capping, not protecting shared mutable state, and not waiting for a
+specific event to occur.
+
+Why a mutex is the wrong tool here
+
+A mutex only supports "1 thread in the critical section at a time" - but
+scarcity problems usually need "N at a time," where N might be 5, 10, or
+50 depending on the resource. Using a mutex for this would either wildly
+under-utilize the resource (force strict serialization, 1 at a time,
+wasting 9 of your 10 available connections) or require awkward
+hand-rolled counting logic re-implementing what a semaphore already does
+correctly.
+
+THE TOOLBOX FOR SCARCITY PROBLEMS
+-----------------------------------------------------
+
+a) Counting semaphores
+The natural fit - a semaphore with N permits allows exactly N concurrent
+holders; the (N+1)th caller to acquire() blocks until someone calls
+release().
+
+    std::counting_semaphore<10> dbConnections(10);
+
+    void handleRequest(Request req) {
+        dbConnections.acquire();          // blocks if 10 already in use
+        try {
+            auto conn = pool.getConnection();
+            conn.execute(req.query);
+        } catch (...) {
+            dbConnections.release();
+            throw;
+        }
+        dbConnections.release();          // frees a slot immediately for the next waiter
+    }
+
+Recall from earlier: semaphores have no ownership concept - any thread
+can call release(), not just the thread that called acquire(). This is
+actually useful for scarcity problems where "the slot becomes free" might
+be detected/triggered by a different thread than the one that originally
+acquired it (e.g., an async callback releasing a connection slot once a
+network response completes).
+
+b) Bounded object pools
+A closely related pattern - pre-allocate exactly N instances of an
+expensive resource (DB connections, HTTP clients, worker buffers) at
+startup, and use a semaphore (or a blocking queue of "available" objects)
+to hand them out and take them back:
+
+    class ConnectionPool {
+        std::counting_semaphore<> permits;
+        BlockingQueue<Connection*> available;
+    public:
+        Connection* acquire() {
+            permits.acquire();
+            return available.take();
+        }
+        void release(Connection* c) {
+            available.put(c);
+            permits.release();
+        }
+    };
+
+This is a nice example of the three problem types composing: the pool
+internally uses a blocking queue (a coordination tool) to hand out
+physical connection objects, wrapped in a semaphore-driven cap (a
+scarcity tool) to bound total concurrency.
+
+c) Rate limiters
+A time-windowed variant of scarcity: "at most N operations per
+second/minute," rather than "at most N concurrent operations." Often
+built as:
+- Token bucket: a counter refilled at a fixed rate, decremented per
+  request, requests block/reject when empty.
+- Sliding window: track timestamps of recent requests, reject/queue if
+  too many fall within the current window.
+
+These aren't pure semaphores (since the "permits" replenish on a timer
+rather than strictly on release-after-use), but conceptually they're the
+same family: a hard cap on usage, requiring some requests to wait or be
+rejected.
+
+d) Thread pool sizing itself
+Worth recognizing: the thread pool discussed earlier - a fixed number of
+worker threads - is itself a scarcity resource. Tasks submitted beyond
+the pool's capacity queue up (using a blocking queue) rather than each
+getting a dedicated new thread. This is precisely why unbounded
+"thread-per-request" designs are dangerous: they treat threads as if they
+were an unlimited resource, when in practice each one costs real memory
+(stack) and OS scheduling overhead.
+
+e) Fairness considerations
+A subtlety scarcity problems often raise in interviews: when a slot frees
+up, who gets it next? A naive semaphore doesn't guarantee FIFO ordering
+among waiters (though many implementations approximate it) - if fairness
+matters (e.g., "first request in line gets served first"), you may need
+an explicit queue of waiters processed in order, rather than relying
+purely on whichever thread the OS happens to wake first.
+
+RECOGNIZING SCARCITY PROBLEMS IN INTERVIEW PROMPTS
+-----------------------------------------------------
+Look for explicit or implicit numeric caps: "at most N connections,"
+"limit concurrent downloads to 5," "rate limit to 100 requests/minute,"
+"connection pool," "only 3 elevators available," "worker pool of size 8."
+The signal is a ceiling on simultaneous usage of something, independent
+of any specific data corruption concern or any specific "wait for this
+one event" concern - it's purely about counting and gating access.
+
+
+HOW THE THREE COMPOSE IN A SINGLE SYSTEM
+========================================================
+
+Real designs almost always combine all three, each solving a distinct
+sub-problem:
+
+Example: a food delivery order system
+- Correctness: two drivers can't be assigned the same order
+  simultaneously - mutex/lock around the assignment check-and-act.
+- Coordination: new orders get pushed onto a queue; available drivers
+  pull from it as they free up - blocking queue (condition variables
+  under the hood).
+- Scarcity: the payment gateway only allows 20 concurrent API calls -
+  semaphore capping outbound payment requests.
+
+
+
+
+WHY TWO DIFFERENT LOCKS DON'T ACTUALLY PROTECT ANYTHING
+==========================================================
+
+This is a subtle but extremely common bug - the code looks like it's
+using locks correctly (every method has a lock_guard!), but it's actually
+providing zero real protection. Let's unpack exactly why.
+
+
+THE CORE MISUNDERSTANDING
+-----------------------------------------------------
+A mutex only prevents other threads trying to acquire that same mutex
+object from proceeding. It has no idea what data it's "supposed" to be
+protecting - that association exists only in the programmer's head, not
+in the code. If two different pieces of code lock two different mutex
+objects, the mutex system provides no relationship between them
+whatsoever - as far as the OS/runtime is concerned, they're two
+completely unrelated locks that happen to live in the same class.
+
+    std::mutex mutex1;
+    std::mutex mutex2;
+
+    bool isAvailable(...) {
+        std::lock_guard<std::mutex> lock(mutex1);   // locks mutex1
+        return seatOwners.find(seatId) == seatOwners.end();
+    }
+
+    void markBooked(...) {
+        std::lock_guard<std::mutex> lock(mutex2);   // locks mutex2 - a DIFFERENT object!
+        seatOwners[seatId] = visitorId;
+    }
+
+mutex1 and mutex2 are two entirely separate synchronization objects.
+Locking mutex1 does nothing to prevent someone else from simultaneously
+locking mutex2. They just happen to sit next to each other as member
+variables - the compiler and runtime treat them as completely unrelated.
+
+
+WALKING THROUGH THE ACTUAL RACE
+-----------------------------------------------------
+The whole point of a mutex here is to make "check availability, then
+book it" atomic relative to other threads - the classic check-then-act
+pattern. But with two separate locks, that atomicity guarantee simply
+doesn't exist:
+
+    Thread A calls isAvailable("seat5"):
+      1. Locks mutex1
+      2. Checks seatOwners - seat5 not found, returns true (available)
+      3. Unlocks mutex1
+
+    Thread B calls isAvailable("seat5")  [running concurrently, or right after]:
+      1. Locks mutex1 (or mutex2 - doesn't matter, no conflict either way)
+      2. Checks seatOwners - seat5 STILL not found (Thread A hasn't booked yet)
+      3. Returns true (available)
+
+    Thread A calls markBooked("seat5", "alice"):
+      1. Locks mutex2  <- this succeeds immediately; mutex2 was never
+                           touched by anything Thread B just did
+      2. seatOwners["seat5"] = "alice"
+      3. Unlocks mutex2
+
+    Thread B calls markBooked("seat5", "bob"):
+      1. Locks mutex2 - succeeds (Thread A already released it)
+      2. seatOwners["seat5"] = "bob"   <- OVERWRITES alice's booking!
+      3. Unlocks mutex2
+
+    Result: both A and B believed seat5 was available and both
+    "successfully" booked it - the second write silently clobbers the
+    first, with no error, no exception, nothing. Seat5 is now "owned" by
+    bob, and alice's booking has vanished, even though the code appeared
+    to guard every operation.
+
+Notice: every single method call correctly acquired a lock and released
+it. If you just skimmed the code looking for "does every function have a
+lock_guard?", you'd think it was thread-safe. That's exactly what makes
+this bug so sneaky - it looks protected, but the protection is an
+illusion because the two locks never actually contend with each other.
+
+
+THE RULE: SAME INVARIANT -> SAME LOCK
+-----------------------------------------------------
+The underlying invariant being protected here is: "a seat can be booked
+by at most one visitor." This invariant spans two operations - reading
+seatOwners (the check) and writing to seatOwners (the update). For the
+invariant to actually hold under concurrency, both operations must be
+mutually exclusive with each other - meaning they must contend for the
+same lock object.
+
+    class TicketBookingFixed {
+    private:
+        std::mutex mtx;   // ONE lock, shared by every operation touching seatOwners
+        std::unordered_map<std::string, std::string> seatOwners;
+
+    public:
+        bool isAvailable(const std::string& seatId) {
+            std::lock_guard<std::mutex> lock(mtx);
+            return seatOwners.find(seatId) == seatOwners.end();
+        }
+
+        void markBooked(const std::string& seatId, const std::string& visitorId) {
+            std::lock_guard<std::mutex> lock(mtx);   // SAME lock
+            seatOwners[seatId] = visitorId;
+        }
+    };
+
+But notice - this still doesn't fully fix the race! Even with the same
+lock, if isAvailable() and markBooked() are called as two separate
+function calls, another thread can sneak its own isAvailable() +
+markBooked() sequence in between them:
+
+    Thread A: isAvailable("seat5")  -> locks mtx, checks, unlocks mtx -> true
+    Thread B: isAvailable("seat5")  -> locks mtx, checks, unlocks mtx -> true  (still available!)
+    Thread A: markBooked("seat5", "alice") -> locks mtx, writes, unlocks
+    Thread B: markBooked("seat5", "bob")   -> locks mtx, writes, unlocks  -> overwrites again!
+
+Using the same lock object fixed the "different locks" bug, but the
+check and the act are still two separate critical sections, each
+individually atomic but not atomic together. The real fix has to hold
+the same lock across the entire check-then-act sequence, as one combined
+operation:
+
+    class TicketBookingCorrect {
+    private:
+        std::mutex mtx;
+        std::unordered_map<std::string, std::string> seatOwners;
+
+    public:
+        // ONE method, ONE lock acquisition, covering check AND act together
+        bool bookSeat(const std::string& seatId, const std::string& visitorId) {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (seatOwners.find(seatId) != seatOwners.end()) {
+                return false;   // already booked
+            }
+            seatOwners[seatId] = visitorId;
+            return true;
+        }
+    };
+
+Now the check and the write happen while holding mtx continuously, with
+no gap where another thread could slip in between them. This is the
+actual meaning behind "if you hold the lock during the check, you must
+still hold it during the update" - it's not just about using the same
+mutex object (though that's a prerequisite), it's about holding that one
+lock acquisition across the whole sequence that needs to be atomic,
+rather than releasing and reacquiring it between the check and the act.
+
+
+SUMMARIZING THE TWO LAYERS OF THIS BUG
+-----------------------------------------------------
+Mistake: Different lock objects for related operations
+  Why it's broken: The locks never contend with each other - no actual
+  mutual exclusion exists between the check and the update
+  Fix: Use ONE shared lock object for all operations touching the same
+  invariant
+
+Mistake: Same lock, but separate lock/unlock per operation
+  Why it's broken: Another thread's entire check-then-act sequence can
+  run in the gap between your check and your act
+  Fix: Hold the lock continuously across the full check-then-act
+  sequence - ideally by exposing one atomic method (bookSeat) rather than
+  two separate public methods (isAvailable + markBooked) that callers
+  must remember to sequence correctly themselves
+
+
+THE DEEPER DESIGN LESSON
+-----------------------------------------------------
+Exposing isAvailable() and markBooked() as two separate public methods is
+itself a smell, even with a shared lock - it invites callers to do
+"if (isAvailable(id)) markBooked(id, visitor);", which is exactly the
+check-then-act race, just moved up one level to the caller's code
+instead of inside the class. The safest API design bundles the whole
+invariant-preserving operation into a single method (bookSeat) so there's
+no way for a caller to split it into two separately-lockable pieces in
+the first place.
+
+
+
+DEADLOCK IN SEAT SWAPPING - EXPLAINED IN DETAIL
+==================================================
+
+
+THE SCENARIO: TWO THREADS, TWO RESOURCES, OPPOSITE ORDER
+-----------------------------------------------------
+The core danger here is a classic circular wait deadlock, arising
+specifically because a swap needs two locks at once, and nothing
+constrains the order in which they're acquired.
+
+    bool swapSeats(const std::string& visitor1, const std::string& seat1,
+                   const std::string& visitor2, const std::string& seat2) {
+        std::lock_guard<std::mutex> lock1(getLock(seat1));   // locks seat1 first
+        std::lock_guard<std::mutex> lock2(getLock(seat2));   // then locks seat2
+        // ... perform swap
+        return true;
+    }
+
+The bug: the order locks are acquired in depends entirely on the order of
+the function's arguments, which is just whatever the caller happened to
+pass in. There's no rule saying "always lock the numerically/
+alphabetically smaller seat first" - it's whatever seat1 and seat2 happen
+to be for that particular call.
+
+Walking through the deadlock
+
+Alice wants to swap 7A for 12B: she calls
+swapSeats("alice", "7A", "bob", "12B") -> this locks 7A first, then 12B.
+
+Bob wants to swap 12B for 7A (the mirror request): he calls
+swapSeats("bob", "12B", "alice", "7A") -> this locks 12B first, then 7A.
+
+    Time   Thread A (Alice's swap)              Thread B (Bob's swap)
+    ----   --------------------------------     --------------------------------
+    t0     lock(7A)  -> SUCCESS (holds 7A)
+    t1                                           lock(12B) -> SUCCESS (holds 12B)
+    t2     lock(12B) -> BLOCKS (Thread B holds it)
+    t3                                           lock(7A) -> BLOCKS (Thread A holds it)
+
+    Deadlock: Thread A is waiting for 12B, which Thread B holds.
+              Thread B is waiting for 7A, which Thread A holds.
+              Neither will EVER release what they're holding, because
+              releasing only happens when lock_guard's destructor runs -
+              and that only happens once the function returns - and the
+              function can't return because it's stuck waiting on the
+              SECOND lock() call.
+
+Both threads are now frozen forever. No exception is thrown, no error
+appears - the program just silently hangs on these two threads (and
+anything else that later tries to touch seat 7A or 12B will also hang,
+waiting behind them). This is exactly the "circular wait" pattern: each
+thread holds a resource the other needs, and each is waiting for a
+resource the other holds - a cycle with no way out.
+
+Why fine-grained locking specifically creates this risk
+
+With coarse-grained locking (one single lock for everything), this
+problem literally cannot occur - there's only one lock, so there's no
+"order" to get wrong. Deadlock via lock ordering is a risk that
+specifically appears once you introduce multiple, independent lock
+objects - which is exactly the tradeoff mentioned earlier: fine-grained
+locking buys you better concurrency, but it reintroduces a new failure
+mode (ordering-dependent deadlock) that coarse-grained locking simply
+doesn't have.
+
+
+THE FIX: CONSISTENT LOCK ORDERING
+-----------------------------------------------------
+The fix doesn't eliminate the need for two locks - it eliminates the
+possibility that two threads acquire them in opposite order. If every
+thread, regardless of which seat is "first" or "second" in its own
+function call, always locks seats in the same globally agreed-upon order
+(e.g., alphabetically/numerically smaller seat ID first), then two
+threads can never form a cycle.
+
+    bool swapSeats(const std::string& visitor1, const std::string& seat1,
+                   const std::string& visitor2, const std::string& seat2) {
+        // Always acquire locks in consistent order to prevent deadlock
+        const std::string& first = seat1 < seat2 ? seat1 : seat2;
+        const std::string& second = seat1 < seat2 ? seat2 : seat1;
+
+        // std::scoped_lock acquires multiple locks without deadlock
+        std::scoped_lock lock(getLock(first), getLock(second));
+        // ... perform swap
+        return true;
+    }
+
+Why this actually prevents the deadlock
+
+Regardless of whether Alice calls
+swapSeats("alice", "7A", "bob", "12B") or Bob calls
+swapSeats("bob", "12B", "alice", "7A"), the code computes first and
+second independently of argument order: since "12B" < "7A" is true (or
+false, whichever way string comparison goes - the point is it's
+deterministic), both calls agree on which seat gets locked first.
+
+    Both Alice's call and Bob's call compute:
+       first  = "12B"   (whichever string compares smaller)
+       second = "7A"
+
+    Time   Thread A (Alice)                     Thread B (Bob)
+    ----   --------------------------------     --------------------------------
+    t0     tries to lock "12B" first...
+    t1                                           tries to lock "12B" first too...
+    t2     SUCCEEDS (gets 12B)
+    t3                                           BLOCKS, waiting for 12B
+    t4     locks "7A" too (no contest, B doesn't have it)
+    t5     performs swap, releases both locks
+    t6                                           (now unblocks) gets 12B
+    t7                                           locks 7A too - free now
+    t8                                           performs swap, releases both locks
+
+No cycle can form: every thread that wants both seats must first
+successfully acquire the same seat ("12B") before even attempting the
+second one. Whoever gets there first proceeds through both locks and
+finishes; the other thread simply waits its turn on the very first lock,
+never getting a chance to hold one lock while waiting on the other. This
+is the general principle: as long as all threads acquire multiple locks
+in a single, globally consistent order, deadlock via circular wait
+becomes impossible - you can prove this formally (it's the classic "lock
+ordering" or "lock hierarchy" deadlock-prevention technique).
+
+Why std::scoped_lock instead of two separate lock_guards
+
+    std::scoped_lock lock(getLock(first), getLock(second));
+
+std::scoped_lock (C++17) takes multiple mutexes at once and acquires them
+all using a deadlock-avoidance algorithm internally (essentially: try to
+lock all of them, and if it can't get one, release whatever it already
+grabbed and retry, rather than blocking indefinitely while holding a
+partial set). This is actually a second, independent layer of
+protection, on top of the manual ordering - even if you'd forgotten to
+sort first/second yourself, scoped_lock given multiple mutexes in one
+call is specifically designed to never deadlock against another
+scoped_lock/std::lock call trying to acquire an overlapping set of
+mutexes, regardless of the order they were passed in. Doing the manual
+sort here is still good practice for clarity and consistency across the
+codebase (e.g., if some other piece of code locks them one at a time
+instead of via scoped_lock), but scoped_lock itself is already
+deadlock-safe for this exact multi-lock-acquisition scenario.
+
+
+BEYOND DEADLOCK: THE OTHER COSTS OF FINE-GRAINED LOCKING
+-----------------------------------------------------
+
+1. Dynamic lock creation and growth
+
+    std::mutex& getLock(const std::string& seatId);  // presumably creates-or-looks-up a lock per seat
+
+Since each seat needs its own lock object, and seats/locks are presumably
+created as needed (a map of seatId -> mutex), that map grows every time
+a new seat/resource is introduced. For a venue with a fixed, bounded
+number of seats (say, 500), this is completely fine - you'd have at most
+500 lock objects, a trivial amount of memory. But if the "resource" being
+locked were something unbounded - e.g., a lock per user session, or per
+dynamically generated document ID - the map of locks would grow
+indefinitely as new resources appear, becoming a memory leak unless you
+add logic to clean up locks for resources that no longer exist or are no
+longer being contended.
+
+2. Mental overhead of tracking which lock guards which data
+
+With one lock, there's never any ambiguity: if you're holding the lock,
+you know you have exclusive access to everything it protects. With many
+locks, you now have to maintain a mental (or documented) mapping of
+"this piece of data is protected by this specific lock" - and it becomes
+very easy to introduce a bug where some code path accesses shared state
+while holding the wrong lock (or no lock at all), silently reintroducing
+a race condition that looks, superficially, like it's "protected"
+because some lock is being held nearby - this is exactly the "different
+lock objects" mistake covered earlier, just from a different angle
+(accidental inconsistency in maintenance, rather than an intentional
+design error upfront).
+
+
+THE PRACTICAL INTERVIEW RULE: WHEN DOES FINE-GRAINED LOCKING ACTUALLY MATTER?
+-----------------------------------------------------
+If a human is triggering the operation (clicking "book seat," submitting
+a request through a UI), coarse-grained locking is almost always
+sufficient - even at massive scale. The reasoning: human-driven request
+rates, even for something as popular as ticket sales for 10,000
+concurrent users, will realistically only produce a handful of requests
+landing on the lock in the same microsecond window. A single
+coarse-grained lock, held only briefly per operation, handles that
+trivially - the "cost" of serializing those few dozen simultaneous
+requests is negligible compared to the complexity and deadlock risk
+fine-grained locking introduces.
+
+This is echoed by real production experience: engineers who've built
+these systems tend to have been burned by subtle bugs from an
+unnecessary fine-grained lock somewhere, and the most experienced among
+them are specifically wary of premature optimization - adding
+per-resource locking before there's actual evidence (via profiling, not
+guessing) that a single coarse-grained lock is a genuine throughput
+bottleneck.
+
+Fine-grained locking earns its complexity when the traffic is
+machine-generated at scale - not humans clicking buttons, but things
+like:
+- A connection pool handling thousands of database queries per second,
+  where lock contention on a single mutex really would become a
+  measurable bottleneck.
+- A cache serving tens of thousands of requests per second, where
+  read-write locks or per-shard locking (a common pattern: split the
+  cache into N independent shards, each with its own lock, to spread
+  contention) meaningfully improves throughput.
+
+The dividing line, in short: request rate and contention level determine
+whether fine-grained locking is solving a real problem or just adding
+risk (deadlocks, memory growth, maintenance complexity) for a
+performance gain you don't actually need yet.
+
+
+
+COORDINATION - THEORY (LOW LEVEL DESIGN / CONCURRENCY)
+==========================================================
+
+Coordination is about threads communicating and handing off work. One
+thread produces tasks, another consumes them. A service sends a request,
+another service processes it. How do independent execution paths signal
+each other without burning CPU or corrupting state?
+
+
+THE PROBLEM
+==========================================================
+
+Imagine building a task scheduler for a web app. Some work simply
+doesn't belong on the request path - it takes too long, and if run
+inline, every API call ends up blocked.
+
+So that work gets pushed into the background. Users sign up and need
+welcome emails. They upload profile photos that need resizing. Admins
+request monthly reports that take minutes to generate. API handlers
+enqueue tasks, and a pool of worker threads processes them
+asynchronously.
+
+Conceptually, the architecture is simple: API handlers produce tasks,
+workers consume them, and something sits in between to coordinate the
+handoff.
+
+When load is steady, this works well, but cracks start to show on the
+edges.
+
+WHAT HAPPENS WHEN WORKERS ARE READY BUT THERE'S NO WORK?
+-----------------------------------------------------
+
+Busy-waiting (anti-pattern)
+
+    while (true) {
+        if (!queue.empty()) {
+            Task task = queue.front();
+            queue.pop();
+            execute(task);
+        }
+    }
+
+Each worker spins in a tight loop, burning CPU while doing no useful
+work. With eight workers on an eight-core machine, you can consume 100%
+of your compute capacity just checking an empty queue. When tasks
+finally arrive, there's no CPU left to run them.
+
+Sleep-polling (anti-pattern)
+
+    while (true) {
+        if (!queue.empty()) {
+            Task task = queue.front();
+            queue.pop();
+            execute(task);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+This reduces CPU usage, but trades waste for latency. A task that
+arrives 1 ms after a worker goes to sleep waits nearly 100 ms before
+being processed. Sleep longer and the system feels sluggish. Sleep
+shorter and you're back to burning CPU.
+
+WHAT HAPPENS WHEN PRODUCERS ARE FASTER THAN CONSUMERS?
+-----------------------------------------------------
+
+Say a marketing email goes out and 50,000 users click a link at once.
+Each request enqueues background work.
+
+    09:00:00.000 - Queue size: 0
+    09:00:00.100 - Queue size: 5,000
+    09:00:00.200 - Queue size: 12,000
+    09:00:00.300 - Queue size: 23,000
+    09:00:00.400 - Queue size: 38,000
+    09:00:00.500 - Queue size: 50,000
+
+Eight workers processing maybe 100 tasks per second means draining a
+queue of thousands takes minutes. The delay itself isn't what kills you
+though - memory is the real problem. Every task sitting in the queue is
+an object on the heap consuming memory. If the queue is unbounded and
+keeps accepting new tasks, it just grows and grows until eventually you
+hit an OutOfMemoryError. When that happens, the entire service crashes -
+not just background processing, but the whole thing. The API goes down
+and everything stops working.
+
+THREE THINGS THAT NEED SOLVING
+-----------------------------------------------------
+This is a coordination problem. How do threads communicate and sequence
+their work? They need to signal each other ("work is ready"), wait
+efficiently without burning CPU, and handle the case where one side is
+faster than the other.
+
+1. Efficient waiting - consumers should sleep when there's no work,
+   waking immediately when work arrives
+2. Backpressure - producers should slow down when consumers can't keep
+   up, preventing memory exhaustion
+3. Thread safety - the coordination mechanism itself must handle
+   concurrent access without corruption
+
+
+THE SOLUTIONS
+==========================================================
+
+There are two fundamentally different approaches to solving these
+problems.
+
+- Shared state coordination uses data structures that multiple threads
+  access directly, like a queue that producers push to and consumers
+  pull from.
+- Message passing coordination avoids shared state entirely. Each
+  component has its own inbox and communicates by sending messages.
+
+
+SHARED STATE COORDINATION
+==========================================================
+
+The most common approach to coordination uses shared data structures.
+Threads communicate by reading and writing to the same memory. A
+producer adds an item to a queue, a consumer removes it. The queue is
+the shared state, and synchronization primitives like locks and
+condition variables ensure threads don't step on each other.
+
+WAIT/NOTIFY (CONDITION VARIABLES)
+-----------------------------------------------------
+Wait/notify is a low-level primitive for thread coordination that is
+useful to know, but is unlikely to be used directly in an interview.
+
+Workers spinning in a loop checking if there's work burns CPU without
+doing anything useful. Workers need to actually sleep when there's
+nothing to do, then wake up the instant work arrives. That's what
+condition variables provide.
+
+The pattern:
+You have a lock protecting some shared state and a condition variable
+attached to that lock. When a thread needs to wait for a condition to
+become true, it calls wait on the condition variable. Two things happen
+atomically:
+
+1. The thread releases the lock and goes to sleep.
+2. The thread stops consuming CPU entirely - completely parked until
+   explicitly woken.
+
+When another thread changes the shared state, it signals the condition
+variable to wake waiting threads. Those threads have to reacquire the
+lock before they can proceed. Once a thread gets the lock back, it wakes
+up and continues executing.
+
+The specific API varies by language: Java calls them wait/notify methods
+on the lock object. C++ has std::condition_variable with wait/notify
+methods. Python has threading.Condition with wait/notify. Go uses
+channels which hide this pattern entirely. The underlying mechanism is
+the same across all of them.
+
+The pattern:
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!conditionIsMet()) {
+            cv.wait(lock);  // Releases lock, sleeps until notified
+        }
+        doWork();
+        cv.notify_all();  // Wakes all waiting threads
+    }
+
+C++ uses std::condition_variable with std::unique_lock. wait() atomically
+releases the mutex and sleeps. notify_all() wakes all waiting threads.
+The mutex is reacquired before wait() returns. Use unique_lock rather
+than lock_guard since wait() needs to unlock.
+
+The while loop is essential. When a thread wakes from wait(), it must
+recheck the condition because another thread might have already consumed
+what it was waiting for between when this thread was notified and when
+it reacquired the lock. Threads can also be woken spuriously without any
+notify() call, so the condition must always be verified after waking.
+
+The benefit over polling is enormous. With sleep-based polling, workers
+either waste CPU (short sleep) or have high latency (long sleep). With
+wait/notify, workers consume zero CPU when idle and wake immediately when
+work arrives.
+
+Challenges: notify_one vs notify_all
+
+The trickiest part about condition variables is deciding whether to wake
+one thread or all threads.
+
+Say you have a queue with both producers and consumers waiting on the
+same condition variable. Three producers are blocked waiting for space
+in the queue. Two consumers are blocked waiting for items. A consumer
+finishes processing an item and frees up space. It signals the condition
+variable to wake one waiting thread.
+
+Which thread wakes up? The runtime picks one arbitrarily. It might pick
+another consumer, even though consumers need items, not space. That
+consumer wakes up, sees the queue is still empty, and goes back to
+sleep. Meanwhile the producers that actually need to know about the free
+space stay asleep and nobody makes progress.
+
+The safe fix is to wake all threads instead of just one. Now when space
+frees up, all waiting threads wake up. The consumers see the queue is
+still empty and go back to sleep. The producers see space is available,
+one of them grabs it, and work continues.
+
+But waking all threads has a cost. If you have 50 threads waiting and
+only one can actually proceed, you just woke 49 threads for nothing. They
+all compete for the lock, check the condition, see it's not met, and go
+back to sleep - a lot of wasted context switches.
+
+The better solution is to use separate condition variables: one for
+"queue not empty" that only consumers wait on, another for "queue not
+full" that only producers wait on. Now when a consumer frees up space, it
+signals the "not full" condition, waking only producers. When a producer
+adds an item, it signals the "not empty" condition, waking only
+consumers - no more wasted wakeups.
+
+BLOCKING QUEUES
+-----------------------------------------------------
+Wait/notify gives you the building blocks for thread coordination, but
+you rarely implement it from scratch. Most languages provide a blocking
+queue that does all the work for you.
+
+A blocking queue is just a thread-safe queue with special behavior when
+it's empty or full. When you try to remove an item from an empty queue,
+the call blocks instead of returning immediately. Your thread goes to
+sleep using condition variables under the hood. When another thread adds
+an item, it wakes you up and you get the item. Same thing in reverse
+when the queue is full - trying to add an item blocks until space frees
+up.
+
+This is exactly what's needed for producer-consumer problems. Producers
+call put to add items. Consumers call take to remove items, and the
+queue handles all the synchronization, all the waiting, all the
+signaling. Backpressure comes built-in because producers block when the
+queue fills up. Efficient waiting is automatic because consumers sleep
+when the queue is empty.
+
+Blocking queues also appear in resource pooling (scarcity problems),
+where they store actual resource objects instead of tasks - but here the
+focus is on their role as a communication channel between threads,
+coordinating work handoff.
+
+Example - a task scheduler:
+
+    class TaskScheduler {
+        std::queue<std::function<void()>> queue_;
+        std::mutex mutex_;
+        std::condition_variable not_empty_;
+        std::condition_variable not_full_;
+        static constexpr size_t MAX_SIZE = 1000;
+
+    public:
+        void submitTask(std::function<void()> task) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            not_full_.wait(lock, [this] { return queue_.size() < MAX_SIZE; });
+            queue_.push(std::move(task));
+            not_empty_.notify_one();
+        }
+
+        void workerLoop() {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    not_empty_.wait(lock, [this] { return !queue_.empty(); });
+                    task = std::move(queue_.front());
+                    queue_.pop();
+                    not_full_.notify_one();
+                }
+                task();
+            }
+        }
+    };
+
+C++ doesn't have a standard blocking queue, so you build one with
+std::queue, std::mutex, and std::condition_variable. Two condition
+variables provide efficient signaling: one for "not empty" (consumers
+wait), one for "not full" (producers wait). The queue handles all the
+synchronization, so multiple producers and consumers can operate
+concurrently without corrupting state.
+
+In interviews, BlockingQueue is the default answer for producer-consumer
+problems: "I'll use a blocking queue so consumers wait efficiently and
+the synchronization is handled for me."
+
+Challenges (blocking queues)
+
+- The biggest mistake is creating an unbounded queue. Always pass a
+  capacity: new LinkedBlockingQueue<>(1000). Otherwise you're back to
+  the memory exhaustion problem.
+- Choosing capacity: size the buffer based on expected burst tolerance.
+  If workers handle 100 tasks/sec and you want to absorb a 10-second
+  spike without blocking producers, you need a buffer of 1,000 tasks.
+  Too small and producers block frequently, hurting throughput. Too
+  large and you're back to excessive memory usage under load.
+- What happens when the queue fills up - three options:
+    * Block producers with put() - for internal pipelines where slowing
+      down is acceptable (e.g., a batch job feeding a processing stage).
+    * Timeout and reject with offer(timeout) - for request paths where
+      you can't stall; return a 503 or "try again later."
+    * Drop and log with offer() (no timeout, returns false immediately)
+      - for lossy workloads like analytics events where dropping under
+      load is acceptable.
+- InterruptedException: both put() and take() throw this. It's thrown
+  when another thread interrupts your thread while it's blocked waiting.
+  The worst thing you can do is catch it and ignore it - that swallows
+  the signal that someone is trying to stop your thread. Either let the
+  exception propagate by declaring it in your method signature, or if
+  you must catch it, restore the interrupt status via
+  Thread.currentThread().interrupt() so code further up the call stack
+  knows the thread was interrupted.
+- Graceful shutdown - workers sit in take() blocked forever. Three
+  options to stop them:
+
+  -- important 
+  
+    1. Interrupt the worker threads - interrupting a thread blocked in
+       take() wakes it up and throws InterruptedException; the worker
+       catches this, breaks out of its loop, and exits cleanly. Simplest
+       approach.
+    2. Use poll with a timeout - instead of blocking forever with
+       take(), use poll(timeout). The worker waits up to the timeout for
+       a task; if nothing shows up, poll returns null, giving a chance
+       to check a shutdown flag periodically. Workers notice within one
+       timeout period and exit.
+    3. Poison pill pattern - create a special sentinel task meaning
+       "shut down." Submit one poison pill per worker to the queue. Each
+       worker processes tasks normally until it pulls a poison pill,
+       then exits its loop. Works well when you can't interrupt threads
+       or don't want to use timeouts.
+
+
+MESSAGE PASSING COORDINATION
+==========================================================
+
+A fundamentally different way to think about coordination: instead of
+multiple threads accessing shared data structures, each thread has its
+own private state and communicates only by sending messages.
+
+This is the actor model. An actor is an independent unit of computation
+with three properties: it has a mailbox (a queue of incoming messages),
+it processes messages one at a time, and it can send messages to other
+actors. No shared state, no locks. Each actor is single-threaded
+internally, so there's no concurrent access to worry about within an
+actor.
+
+The model originated in the 1970s but gained practical traction with
+Erlang. Today you'll find actor implementations in Akka (Scala/Java),
+Orleans (.NET), and libraries for most mainstream languages. Go's
+goroutines with channels are heavily influenced by similar ideas, though
+not strictly actors.
+
+THE ACTOR MODEL
+-----------------------------------------------------
+An actor is an object with a mailbox and a message handler. When you
+send a message to an actor, it goes into its mailbox. The actor pulls
+messages one at a time and processes them. Because only one message is
+processed at a time, the actor's internal state never faces concurrent
+access.
+
+Underlying machinery (C++ example): a queue protected by a mutex, a
+condition variable for efficient waiting, and a dedicated thread running
+the message loop - exactly what blocking queues do internally, exposed
+to show the mechanics.
+
+Key insight: there are no locks in the message handler. The actor
+processes one message at a time, so onReceive() never runs concurrently
+with itself. Any state the actor maintains is accessed sequentially -
+mutable fields, counters, caches, whatever's needed, without
+synchronization inside the actor's logic. The mailbox itself still needs
+synchronization when multiple threads send messages to the same actor -
+the underlying queue uses locks internally to handle concurrent send()
+calls.
+
+Actors centralize all synchronization at a single, well-defined boundary
+(the mailbox) and keep it out of your business logic. You're trading
+scattered locks throughout your code for one proven queue implementation
+handling all the concurrent access.
+
+Compare to shared state coordination: with a blocking queue, multiple
+worker threads pull from the same queue and might process tasks that
+touch the same data - you need locks or other synchronization to protect
+that shared data. With actors, each actor owns its data exclusively.
+Coordination happens through message passing, not shared memory.
+
+Example: an EmailActor receives EmailRequest messages and sends emails
+via its own private EmailClient - no shared state, no locks needed by
+callers. A SignupHandler just creates a message and calls send() on the
+actor; the actor's thread handles the actual work, with mutex/condition
+variable complexity hidden inside.
+
+The structure looks similar to the blocking queue version, but the
+mental model is different. With blocking queues, you think about shared
+data and synchronization. With actors, you think about messages and
+ownership. The actor owns its resources; nobody else touches them.
+Communication is explicit - everything happens through send().
+
+WHEN TO USE ACTORS
+-----------------------------------------------------
+Actors shine when you have many independent entities that occasionally
+need to communicate: a chat system where each user session is an actor,
+a game server where each player or game room is an actor, a trading
+system where each order book is an actor. Each entity has its own state,
+processes events sequentially, and messages other entities when needed.
+
+The model also scales well. Because actors don't share state, you can
+distribute them across machines - send a message to an actor on another
+server the same way you'd send to a local one. Erlang and Akka build
+entire distributed systems on this property.
+
+But actors aren't always the right choice. For simple producer-consumer
+problems where you just need to hand work from one thread to another, a
+blocking queue is simpler and more direct. Actors add conceptual overhead
+- message types, actor lifecycles, message delivery guarantees.
+
+Rule of thumb: if your problem is "process these tasks in the
+background," use a blocking queue. If your problem is "coordinate many
+independent entities with their own state," consider actors.
+
+In interviews, blocking queues remain the default answer for
+producer-consumer. If asked about alternatives, or the problem involves
+many independent stateful entities (game servers, chat systems, trading
+platforms), mention actors: "Another approach is the actor model, where
+each entity processes its own messages sequentially. That eliminates
+shared state within each actor."
+
+CHALLENGES (ACTOR MODEL)
+-----------------------------------------------------
+The actor model trades one set of problems for another. No more locks
+and race conditions on shared state, but new concerns:
+
+- Mailbox overflow. Just like blocking queues, actor mailboxes can fill
+  up if producers are faster than the actor can process. Most frameworks
+  let you configure mailbox size and overflow behavior - drop messages,
+  block senders, or apply backpressure.
+- Message ordering. Messages from actor A to actor B arrive in order.
+  But if actors A and C both send to B, the interleaving is undefined.
+  If your logic depends on global ordering across senders, actors get
+  complicated.
+- Debugging. When something goes wrong in a system of actors, the bug
+  might be in how messages flow rather than in any single piece of code.
+  Tracing a request through multiple actors is harder than stepping
+  through a single call stack.
+- Request-response patterns. Actors communicate asynchronously. If you
+  need to send a message and wait for a reply, you have to build that
+  pattern yourself - send a message with a callback address, then wait
+  for the response message. Some frameworks provide "ask" patterns that
+  hide this complexity.
+
+
+COMMON PROBLEMS (RECOGNIZING THE PATTERN IN INTERVIEWS)
+==========================================================
+
+Producer-consumer doesn't appear in interviews as an abstract data
+structure problem. It shows up disguised as practical systems where some
+work needs to happen asynchronously.
+
+PROCESS REQUESTS ASYNCHRONOUSLY
+-----------------------------------------------------
+The most common coordination pattern in interviews. Users make requests
+that need work done, but some of that work is slow and doesn't need to
+happen on the request path. Respond to the user immediately while
+handling the heavy lifting in the background.
+
+The API handler is the producer - it receives the request, does the
+minimum work needed to respond, then hands off a task for background
+processing. Workers or actors are the consumers - they process tasks
+asynchronously.
+
+Example: an email service. Connecting to the email server and sending a
+message takes 500ms. If done inline, every signup request takes half a
+second to respond. Instead: save the user, enqueue an email task, return
+immediately. Background workers handle sending. If the email service is
+slow or down, the task just waits in the queue (or gets retried) - the
+user never sees any of this, since they already got their response.
+
+Examples across interview problems:
+- Image Upload Service: resize/compress/upload to S3 happens via workers
+  after an immediate response to the upload request.
+- Payment Processing: charge card, send receipt, update inventory,
+  create shipping label - all handled by workers after order is saved
+  and the user gets a response.
+- Report Generation: a 10-minute report generation job is enqueued;
+  the admin gets "your report is being generated" immediately and polls
+  or gets notified when it's ready.
+
+When you see "process this after the request completes" or "this takes
+too long to do inline," reach for coordination: "I'll use a blocking
+queue to decouple the API from the background work. The handler enqueues
+tasks and returns immediately. Workers process asynchronously."
+
+HANDLE BURSTY TRAFFIC
+-----------------------------------------------------
+Bursty traffic is when load comes in waves instead of steadily - a news
+site spike on breaking news, an e-commerce surge on Black Friday, a
+ticket seller hammered when tickets go on sale.
+
+The naive approach is to scale workers to handle peak load - but those
+workers sit idle most of the time, wasting money.
+
+Coordination solves this with a buffer: size workers for normal load
+(e.g., 100 workers). When a burst hits, the queue absorbs the spike.
+Requests pile up while workers churn through them at their normal rate.
+After the burst ends, workers drain the queue and everything returns to
+normal - a 100x spike smoothed into steady processing with a bounded
+queue.
+
+Example: a ticket purchase service uses wait_for() with a timeout on the
+producer side (offer/put with timeout) - if the queue can't accept a
+request within the timeout, throw an error ("too many requests, try
+again") rather than blocking the request handler forever. This lets
+request handlers fail fast under overload while workers keep processing
+at a sustainable rate.
+
+Examples across interview problems:
+- News Site: page-view events enqueued during a traffic spike; analytics
+  workers process at a steady rate.
+- Email Campaign: millions of link clicks enqueued as events; workers
+  process steadily rather than crushing the tracking system.
+- Batch Job Completion: millions of completion notifications enqueued
+  rather than sent all at once, protecting the notification service.
+- Webhooks: payment provider webhook events enqueued during a flash
+  sale; workers process them steadily, preventing database connection
+  exhaustion.
+
+When you see "traffic is unpredictable" or "load comes in spikes," reach
+for coordination: "I'll use a blocking queue to buffer requests during
+bursts. Workers process at a steady rate, and the queue smooths the
+spike. I'll size the queue based on expected burst duration and peak
+rate."
+
+
+CONCLUSION
+==========================================================
+Coordination is about how threads communicate and hand off work. Two
+paradigms solve this differently.
+
+- Shared state coordination uses data structures that multiple threads
+  access - blocking queues being the workhorse. Producers push,
+  consumers pull, and the queue handles synchronization. This is the
+  right default for producer-consumer problems in interviews.
+- Message passing coordination avoids shared state entirely. Actors own
+  their data and communicate through messages. Each actor processes
+  sequentially, eliminating locks within the actor. This shines for
+  systems with many independent stateful entities.
+
+For most interview problems, the answer is a bounded BlockingQueue with
+put() for producers and take() for consumers. When asked how to handle
+the queue filling up, explain sizing it based on expected burst duration
+- if workers process 100 tasks/sec and you want to handle a 10-second
+spike, you need capacity for 1,000 tasks. If the producer is on a
+request path where blocking isn't acceptable, use offer(timeout) and
+return an error to the caller when the queue is full.
+
+If asked about alternatives, or the problem involves many independent
+entities with their own state, mention actors. The key insight: actors
+eliminate shared state by design - each actor owns its data exclusively
+and processes messages sequentially.
+
+The pattern is always the same: producers generate work, consumers
+process it, and something coordinates the handoff. When you recognize
+that structure in an interview problem - background emails, image
+processing, analytics pipelines, rate-smoothing for bursty traffic -
+reach for a blocking queue and worker pool. For systems with many
+stateful entities that need to communicate, consider whether actors
+would simplify the design.
+
+
+QUIZ NOTE
+==========================================================
+Q: What problem does sleep-polling introduce compared to busy-waiting?
+A: Added latency. Busy-waiting burns CPU but reacts to new work
+   instantly. Sleep-polling reduces CPU usage but introduces delay - a
+   task arriving just after a worker goes to sleep may wait nearly the
+   full sleep interval before being noticed. This is the exact
+   motivation for condition variables (wait/notify): zero CPU usage
+   while idle, and near-instant wake-up when work arrives.
+
+
+
+
